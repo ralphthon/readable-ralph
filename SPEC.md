@@ -686,6 +686,31 @@ if (prev && next.iteration > prev.iteration) {
 }
 ```
 
+**Final iteration snapshot (terminal state capture):**
+
+When the loop transitions to `'completed'` or `'cancelled'`, the current iteration counter does **not** increment — so the code above never fires for the last round. Capture it explicitly on terminal transition:
+
+```typescript
+// Inside setLoopState, on terminal transition:
+const isTerminal  = next.phase === 'completed' || next.phase === 'cancelled';
+const wasTerminal = prev?.phase === 'completed' || prev?.phase === 'cancelled';
+
+if (isTerminal && !wasTerminal) {
+  const snapshot: ProgressSnapshot = {
+    iteration: next.iteration,
+    completed: get().progress?.completed ?? [],
+    decisions: get().progress?.decisions ?? [],
+    uncertainties: get().progress?.uncertainties ?? [],
+    remainingGap: get().progress?.remainingGap ?? [],
+    confidence: get().progress?.confidence ?? null,
+    nextStep: get().progress?.nextStep ?? null,
+  };
+  get().updateIteration({ iteration: next.iteration, progressSnapshot: snapshot });
+}
+```
+
+**Invariant:** every `IterationItem` that actually executed must have a `progressSnapshot`. The IterationTimeline (§7.2) and EpisodeList (§7.13.5) must never show "No details" for a completed or cancelled round.
+
 ---
 
 ## 7. Feature Specifications
@@ -2182,6 +2207,26 @@ export function MemoryBrowser() {
 
 ---
 
+#### 7.13.10b RubricViewer — Placement After Rewrite
+
+The original `MemoryBrowser` rendered `<RubricViewer />` at the bottom. The §7.13 rewrite must preserve this.
+
+Add as the last section inside `MemoryBrowser`, after `JudgeNarrativeList` and before `JudgeEvolutionLog` (§7.7):
+
+```tsx
+{rubricsContent && (
+  <section className="narrative-section">
+    <div className="narrative-section-label">Quality Rubric</div>
+    <RubricViewer />
+  </section>
+)}
+```
+
+- Only render when `rubricsContent !== null` (same guard as before).
+- `RubricViewer` is an existing component — no changes to it required.
+
+---
+
 #### 7.13.11 `explainer.ts` — Required New Exports
 
 Add these alongside existing exports. Do not remove existing functions.
@@ -2678,6 +2723,12 @@ Every item must pass before the feature is considered complete.
 [ ] A11. 'iteration-failed' dot color = var(--red)
 
 [ ] A12. 'loop-completed' dot color = var(--accent)
+
+[ ] A13. Sequence: phase=paused → loop-state-changed(active:true) → 'loop-resumed' event in activityEvents;
+         dot color = var(--cyan)
+
+[ ] A14. loop-state-changed(phase:'cancelled') → 'loop-cancelled' event in activityEvents;
+         dot color = var(--red)
 ```
 
 ### IterationTimeline
@@ -2700,6 +2751,10 @@ Every item must pass before the feature is considered complete.
 [ ] T8.  snapshot.confidence === null → confidence display is absent (no "null%" or "0%")
 
 [ ] T9.  snapshot.completed.length === 0 → completed section not rendered at all
+
+[ ] T10. loop completes (phase→'completed') → final round node in IterationTimeline
+         has a progressSnapshot (not undefined); clicking it shows "What was built"
+         (tests §6.3 terminal snapshot capture)
 ```
 
 ### SessionReport
