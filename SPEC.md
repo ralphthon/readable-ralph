@@ -1489,6 +1489,133 @@ async fn send_command_enter_inner(project_id: &str, data: &str) -> Result<(), St
 
 ---
 
+### 7.12 Usage Tracking
+
+#### 7.12.1 Current State & Gaps
+
+| Item | Status | Gap |
+|------|--------|-----|
+| `loopState.iteration / maxIterations` display | ✅ Working | — |
+| Estimated cost KRW (`estimateCostKrw(iteration)`) | ✅ Working | Static — only re-renders on other state changes |
+| Elapsed time (`formatElapsed(startedAt)`) | ⚠️ Partial | No live timer; only re-renders on state changes |
+| `loopStartTimeMs` field in store | ❌ Dead store | Set once, never read; all UI uses `loopState.startedAt` |
+| `formatElapsedMinutes()` in cost-calculator.ts | ❌ Dead code | Never imported or called |
+| SessionReport stats row | ❌ Missing | Elapsed time and cost not shown in completed view |
+
+#### 7.12.2 Time Source — Canonical Rule
+
+**There must be exactly one source of truth for loop start time.**
+
+Use `loopState.startedAt` (ISO string from the gulf-loop state file) as the canonical source:
+- It reflects the actual time the loop agent wrote the file, not the time the UI processed the event.
+- It survives session restore (`load_session` populates `loopState.startedAt` from the saved state).
+
+**`loopStartTimeMs` role:** keep the field for session persistence (it is already serialised into `session.json`). Do not display it directly; do not remove it. Consider it an internal bookmark, not a display source.
+
+**Remove `formatElapsedMinutes`** from `cost-calculator.ts` — it duplicates `formatElapsed` in `explainer.ts` and is never called.
+
+#### 7.12.3 Live Elapsed Time — Interval Re-render
+
+`TokenUsageCard` and `StatusBar` only re-render when Zustand state changes. If the loop is idle between iterations, elapsed time freezes on screen.
+
+**Fix:** add a 30-second interval inside `TokenUsageCard` (and `StatusBar` if it shows elapsed time) that forces a local state tick to trigger re-render.
+
+```typescript
+// TokenUsageCard.tsx
+const [, forceRender] = useReducer(n => n + 1, 0);
+
+useEffect(() => {
+  if (loopState?.phase !== 'running') return;
+  const id = setInterval(forceRender, 30_000);
+  return () => clearInterval(id);
+}, [loopState?.phase]);
+```
+
+**Contract:**
+- The interval runs **only while `phase === 'running'`**. It must not run during `paused`, `completed`, `cancelled`, or `idle`.
+- The interval is cleared on unmount and on phase change.
+- 30s granularity is sufficient — elapsed display resolves to minutes.
+
+#### 7.12.4 Cost Estimation Constants
+
+```typescript
+// src/lib/cost-calculator.ts — authoritative constants
+export const TOKENS_PER_ITERATION = 8_000;      // conservative per-iteration estimate
+export const COST_PER_MILLION_KRW = 4_800;       // ~$3.50/M × 1,380 KRW/USD
+
+export function estimateCostKrw(iterations: number): number {
+  return Math.round((iterations * TOKENS_PER_ITERATION / 1_000_000) * COST_PER_MILLION_KRW);
+}
+
+export function formatCostKrw(krw: number): string {
+  return `₩${krw.toLocaleString('ko-KR')}`;
+}
+// formatElapsedMinutes — DELETE. Use formatElapsed() from explainer.ts instead.
+```
+
+#### 7.12.5 TokenUsageCard Display Contract
+
+**Required display fields (all must be present when `loopState !== null`):**
+
+| Field | Source | Format |
+|-------|--------|--------|
+| Round progress | `loopState.iteration / loopState.maxIterations` | `"N / M 라운드"` + progress bar |
+| Estimated cost | `estimateCostKrw(loopState.iteration)` | `"약 ₩N,NNN (추정)"` |
+| Elapsed time | `formatElapsed(loopState.startedAt)` | `"방금"` \| `"Nm 경과"` \| `"Nh 경과"` |
+
+**Empty / null guards:**
+- `loopState === null` → render nothing (no placeholder card).
+- `loopState.startedAt === null` → omit elapsed time row entirely (no "0분 경과" placeholder).
+- `loopState.iteration === 0` → show `"₩0 (추정)"`.
+
+#### 7.12.6 SessionReport — Cost & Time in Stats Row
+
+The completed view stats row (§7.5) must include two additional stat cards:
+
+| Stat | Source | Format | Condition |
+|------|--------|--------|-----------|
+| Elapsed time | `formatElapsed(loopState.startedAt)` | `"Nh Nm"` | `startedAt !== null` |
+| Estimated cost | `formatCostKrw(estimateCostKrw(loopState.iteration))` | `"₩N,NNN"` | always |
+
+Updated stats row (replacing the §7.5 spec):
+
+```tsx
+<div className="result-summary-row">
+  <div className="result-stat">
+    <div className="result-stat-value">{loopState.iteration}</div>
+    <div className="result-stat-label">Rounds</div>
+  </div>
+  <div className="result-stat">
+    <div className="result-stat-value">{progress?.completed.length ?? 0}</div>
+    <div className="result-stat-label">Tasks done</div>
+  </div>
+  <div className="result-stat">
+    <div className="result-stat-value">{progress?.confidence ?? '—'}</div>
+    <div className="result-stat-label">Confidence</div>
+  </div>
+  {loopState.startedAt && (
+    <div className="result-stat">
+      <div className="result-stat-value">{formatElapsed(loopState.startedAt)}</div>
+      <div className="result-stat-label">Elapsed</div>
+    </div>
+  )}
+  <div className="result-stat">
+    <div className="result-stat-value">
+      {formatCostKrw(estimateCostKrw(loopState.iteration))}
+    </div>
+    <div className="result-stat-label">Est. cost</div>
+  </div>
+  {loopState.judgeEnabled && (
+    <div className="result-stat">
+      <div className="result-stat-value">{loopState.consecutiveRejections}</div>
+      <div className="result-stat-label">Rejections</div>
+    </div>
+  )}
+</div>
+```
+
+---
+
 ## 8. UI / Layout Specifications
 
 ### 8.1 Titlebar
@@ -1719,6 +1846,9 @@ All files that must be created or modified:
 | `src/components/layout/Titlebar.tsx` | Modify | Icon-only buttons per §8.1 |
 | `src/components/projects/ProjectCard.tsx` | Modify | Tree row pattern per §8.3 |
 | `src/styles/globals.css` | Modify | Add: `snapshot-*`, `activity-event-*`, `result-stat-*`, `question-*`, `tree-row-*`, `activity-tab`, `right-panel-activity-bar` classes |
+| `src/lib/cost-calculator.ts` | Modify | Delete `formatElapsedMinutes`; keep `estimateCostKrw`, `formatCostKrw` (§7.12.4) |
+| `src/components/monitor/TokenUsageCard.tsx` | Modify | Add 30s interval for live re-render (§7.12.3); null guards per §7.12.5 |
+| `src/components/monitor/LoopMonitor.tsx` | Modify | SessionReport stats row: add Elapsed + Est. cost cards (§7.12.6) |
 | `src-tauri/src/watcher/mod.rs` | Verify | Confirm `JUDGE_EVOLUTION.md` → `judge-evolution-changed` is implemented |
 | `src-tauri/src/process/mod.rs` | Modify | `detect_question_block`, `QuestionBlock` struct, emit `claude-question-prompt` |
 | `src/lib/rubric-generator.ts` | Modify | Flatten multi-line prompt (§7.10); defaults `maxIterations=50`, `milestoneEvery=0` |
@@ -1954,6 +2084,34 @@ Every item must pass before the feature is considered complete.
 
 [ ] G14. After sending the gulf-loop command, Claude executes it (LoopMonitor transitions
          from StartingScreen to running view within ~10s of spawn_and_send resolving)
+```
+
+### Usage Tracking (§7.12)
+
+```
+[ ] C1.  TokenUsageCard renders "N / M 라운드" + progress bar when loopState !== null
+
+[ ] C2.  TokenUsageCard renders "약 ₩N,NNN (추정)" using estimateCostKrw(iteration)
+
+[ ] C3.  TokenUsageCard renders elapsed time using formatElapsed(loopState.startedAt)
+
+[ ] C4.  loopState.startedAt === null → elapsed time row absent (no "0분 경과")
+
+[ ] C5.  loopState === null → TokenUsageCard renders nothing
+
+[ ] C6.  Elapsed time updates on screen without requiring a loop state change:
+         wait 30s during a running loop → elapsed label increments
+
+[ ] C7.  The 30s interval does NOT run when phase is paused, completed, or cancelled
+
+[ ] C8.  SessionReport stats row shows Elapsed and Est. cost cards alongside Rounds/Tasks/Confidence
+
+[ ] C9.  SessionReport: loopState.startedAt === null → Elapsed card not rendered
+
+[ ] C10. formatElapsedMinutes is deleted from cost-calculator.ts (or not exported/used)
+
+[ ] C11. loopStartTimeMs is not used as a display source anywhere in the UI
+         (it may remain in session persistence only)
 ```
 
 ### Build Verification
