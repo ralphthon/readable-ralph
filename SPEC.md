@@ -1407,6 +1407,88 @@ No `send_command` (without `_enter`) should be used for slash commands. `send_co
 
 ---
 
+#### 7.11.4 `setActiveProject` Must Be Called Before `spawn_and_send`
+
+**Root cause:**
+
+`App.tsx` event handlers gate every store update on `activeProjectId`:
+
+```typescript
+// App.tsx — loop-state-changed handler (and all other file-watch handlers)
+const { activeProjectId, updateProject } = useStore.getState();
+if (activeProjectId) {          // ← null → entire event silently dropped
+  updateProject(activeProjectId, { status: 'running' });
+}
+```
+
+`spawn_and_send` waits 8 seconds in the Rust backend before returning. During those 8 seconds:
+- `start_watcher` is already running and emitting events
+- The gulf-loop state file can be created and trigger `loop-state-changed`
+- If `activeProjectId` is still `null` at that point, all events are silently dropped and `LoopMonitor` never appears
+
+**Required fix:** call `setActiveProject(projectId, projectPath)` **synchronously before** `invoke('spawn_and_send', ...)`.
+
+```typescript
+// QuickRestartView.tsx / GoalWizard.tsx — correct ordering
+const startLoop = async () => {
+  // 1. Set active project FIRST — must happen before any await
+  setActiveProject(project.id, project.path);
+  await invoke('start_watcher', { projectPath: project.path });
+
+  // 2. Now spawn + send — watcher events during the 8s wait will route correctly
+  const cmd = buildFlatCommand(prompt);
+  await invoke('spawn_and_send', {
+    projectId: project.id,
+    projectPath: project.path,
+    command: cmd,
+    cols: 220,
+    rows: 50,
+  });
+};
+```
+
+**Invariant:** `activeProjectId` in the store must be non-null before the first `start_watcher` call for that project. Any ordering that allows watcher events to fire while `activeProjectId === null` is incorrect.
+
+---
+
+#### 7.11.5 Enter Key Not Delivered — `send_command_enter` Diagnosis
+
+**Symptom:** The gulf-loop slash command is sent to the PTY but Claude does not execute it — as if the Enter key was never received.
+
+**Known causes to check (in order):**
+
+| # | Hypothesis | How to verify | Fix |
+|---|-----------|--------------|-----|
+| 1 | `send_command_enter` appends `\r\n` but PTY expects `\r` only | Log the raw bytes written; check if `\n` after `\r` causes a second blank line | Change to write `\r` only |
+| 2 | `send_command_enter` writes two separate PTY calls (`data` then `\r`) with a gap between them | Check Rust impl — are there two `writer.write_all` calls? | Concatenate and write once: `format!("{}\r", data)` |
+| 3 | Command is sent before the shell prompt is ready (PTY spawned but bash not yet at prompt) | Increase sleep to 10s and test | Increase `tokio::time::sleep` duration |
+| 4 | The command string contains a stray `"` that breaks the shell parsing | Print the exact string before writing | Escape inner quotes |
+
+**Required `send_command_enter` implementation:**
+
+```rust
+// src-tauri/src/lib.rs or process/mod.rs
+async fn send_command_enter_inner(project_id: &str, data: &str) -> Result<(), String> {
+    let mut sessions = SESSIONS.lock().map_err(|e| e.to_string())?;
+    let session = sessions.get_mut(project_id)
+        .ok_or_else(|| format!("No session for {}", project_id))?;
+
+    // Single write: data + carriage return only (no \n)
+    let payload = format!("{}\r", data);
+    session.writer.write_all(payload.as_bytes())
+        .map_err(|e| e.to_string())?;
+
+    Ok(())
+}
+```
+
+**Contract:**
+- `send_command_enter` writes `"{data}\r"` as a **single** `write_all` call.
+- No `\n` appended — PTY line discipline converts `\r` to the newline the shell expects.
+- No delay between data and `\r`.
+
+---
+
 ## 8. UI / Layout Specifications
 
 ### 8.1 Titlebar
@@ -1641,8 +1723,9 @@ All files that must be created or modified:
 | `src-tauri/src/process/mod.rs` | Modify | `detect_question_block`, `QuestionBlock` struct, emit `claude-question-prompt` |
 | `src/lib/rubric-generator.ts` | Modify | Flatten multi-line prompt (§7.10); defaults `maxIterations=50`, `milestoneEvery=0` |
 | `src-tauri/src/lib.rs` | Modify | Add `spawn_and_send` command (§7.11.1) |
-| `src/components/projects/QuickRestartView.tsx` | Modify | Replace spawn+listener with `invoke('spawn_and_send', ...)` (§7.11.1); flatten prompt |
-| `src/components/wizard/GoalWizard.tsx` | Modify | Replace spawn+listener with `invoke('spawn_and_send', ...)` (§7.11.1); flatten prompt |
+| `src/components/projects/QuickRestartView.tsx` | Modify | `setActiveProject` before `start_watcher` (§7.11.4); `invoke('spawn_and_send', ...)` (§7.11.1); flatten prompt |
+| `src/components/wizard/GoalWizard.tsx` | Modify | `setActiveProject` before `start_watcher` (§7.11.4); `invoke('spawn_and_send', ...)` (§7.11.1); flatten prompt |
+| `src-tauri/src/process/mod.rs` | Modify | `send_command_enter`: single `write_all("{data}\r")`, no `\n` (§7.11.5) |
 | `src/components/monitor/MilestoneGate.tsx` | Modify | Add `projectId`; use `send_command_enter` (§7.11.2, §7.11.3) |
 | `src/components/monitor/HITLGate.tsx` | Modify | Unify to `send_command_enter` with `projectId` (§7.11.3) |
 
@@ -1859,6 +1942,18 @@ Every item must pass before the feature is considered complete.
 [ ] G9.  HITLGate "Cancel" button calls invoke('send_command_enter', { projectId, data })
 
 [ ] G10. No gate component uses bare invoke('send_command', ...) for slash commands
+
+[ ] G11. setActiveProject(projectId, projectPath) is called synchronously BEFORE
+         invoke('start_watcher') and invoke('spawn_and_send') in QuickRestartView and GoalWizard
+
+[ ] G12. While spawn_and_send is awaiting (8s), loop-state-changed events are routed
+         to the correct project (verify: activeProjectId is non-null during the wait)
+
+[ ] G13. send_command_enter writes "{data}\r" as a single write_all call — no \n appended,
+         no two separate writes
+
+[ ] G14. After sending the gulf-loop command, Claude executes it (LoopMonitor transitions
+         from StartingScreen to running view within ~10s of spawn_and_send resolving)
 ```
 
 ### Build Verification
