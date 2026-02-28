@@ -56,7 +56,7 @@ return showWizard       ? <GoalWizard />
 | `spawn_claude` | `(app, projectId, projectPath, cols, rows) -> Result<()>` | standalone spawn, no command |
 | `spawn_and_send` | `(app, projectId, projectPath, command, cols, rows) -> Result<()>` | spawn + `tokio::sleep(8s)` + write; returns after send |
 | `send_command` | `(projectId, data) -> Result<()>` | raw PTY write |
-| `send_command_enter` | `(projectId, data) -> Result<()>` | write + `\r\n` |
+| `send_command_enter` | `(projectId, data) -> Result<()>` | `write_all("{data}\r")` — carriage return only, no `\n` (see §7.11.5) |
 | `kill_claude` | `(projectId) -> Result<()>` | |
 | `kill_all_sessions` | `() -> Result<()>` | |
 | `force_reset_session` | `(projectId, projectPath) -> Result<()>` | kills PTY + deletes state file |
@@ -636,6 +636,11 @@ null  (app start / no project selected)
 - `loopState = null` means no file has been seen yet for the active project. `LoopMonitor` must NOT render in this state.
 - Phase never goes `'completed'` → `'running'` without `resetLoop()` first.
 
+**Event payload priority rule (for `loop-state-changed`):**
+- `{ deleted: true, content: null }` → treat as file deletion → transition to `phase = 'completed'` (S5)
+- `{ deleted: false, content: null }` → file unreadable or not yet present → set `loopState = null` (S6)
+- Both fields must be checked; `deleted: true` takes precedence over `content: null`.
+
 ### 6.2 IterationItem Status Derivation
 
 ```typescript
@@ -967,7 +972,7 @@ function formatFeedbackTime(ts: string): string {
 
 3. **Completed tasks** — full list, collapse/expand at 3. Left border `2px solid var(--green)`.
 
-4. **Remaining** — `progress.remainingGap` items. **Only render when `phase === 'cancelled'`**. Left border `2px solid var(--yellow)`.
+4. **Remaining** — `progress.remainingGap` items. **Only render when `phase === 'cancelled'` AND `progress.remainingGap.length > 0`**. Left border `2px solid var(--yellow)`.
 
 5. **Decisions** — `progress.decisions` full list.
 
@@ -1117,6 +1122,8 @@ setActiveQuestion: (q: { question: string; choices: string[] } | null) => void;
 
 ```typescript
 listen<{ question: string; choices: string[] }>('claude-question-prompt', (event) => {
+  // Guard: only show overlay when a loop is active
+  if (!useStore.getState().loopState) return;
   useStore.getState().setActiveQuestion(event.payload);
 });
 ```
@@ -1448,6 +1455,8 @@ const startLoop = async () => {
 ```
 
 **Invariant:** `activeProjectId` in the store must be non-null before the first `start_watcher` call for that project. Any ordering that allows watcher events to fire while `activeProjectId === null` is incorrect.
+
+**Unmount safety:** The `invoke('spawn_and_send', ...)` call resolves after ~8 seconds. The calling component (`QuickRestartView` / `GoalWizard`) may unmount before that (e.g., the loop-state-changed event causes a route change to `LoopMonitor`). The resolved Promise value must not trigger a `setState` call that is conditional on mount state. Since the function only calls `invoke` and the result is not used to set local component state, this is inherently safe — but any future chained `.then()` that touches local state must be guarded with an `isMounted` ref.
 
 ---
 
@@ -1914,7 +1923,8 @@ Every item must pass before the feature is considered complete.
 
 [ ] S5.  loop-state-changed with deleted:true → phase === 'completed'
 
-[ ] S6.  loop-state-changed(content:null) → loopState === null
+[ ] S6.  loop-state-changed({ content:null, deleted:false }) → loopState === null
+         (deleted:true takes precedence → see S5; only deleted:false triggers null reset)
 
 [ ] S7.  After phase='completed', another loop-state-changed does NOT change phase
          (terminal state invariant)
@@ -1999,7 +2009,7 @@ Every item must pass before the feature is considered complete.
 ```
 [ ] H1.  project.status==='completed' + session data exists → click shows SessionReport
 
-[ ] H2.  project.status==='completed' + no session data → click shows QuickRestartView
+[ ] H2.  project.status==='completed' OR 'cancelled' + no session data → click shows QuickRestartView
 
 [ ] H3.  project.status==='running' → click shows LoopMonitor (running view)
 
