@@ -1706,6 +1706,498 @@ Updated stats row (replacing the §7.5 spec):
 
 ---
 
+### 7.13 Narrative Memory Panel — Non-Developer View
+
+**Problem with current MemoryBrowser:** It shows raw lists copied directly from `progress.txt` — technical jargon, bullet fragments, no context. A non-developer cannot understand what the AI actually decided, why, or what it means for the project.
+
+**Goal:** Replace `MemoryBrowser` with a narrative-first panel that tells the story of the project. Every section must be readable by someone with no coding background.
+
+**File:** `src/components/memory/MemoryBrowser.tsx` (full rewrite)
+**File:** `src/lib/explainer.ts` (add narrative sentence functions)
+
+---
+
+#### 7.13.1 Panel Layout (top to bottom)
+
+```
+┌──────────────────────────────────────┐
+│  PROJECT GOAL                        │  GoalCard
+│  [originalGoal plain text]           │
+├──────────────────────────────────────┤
+│  WHERE WE ARE                        │  ProgressCard
+│  Round 4 · 72% confidence           │
+│  [ConfidenceBar + contextual label]  │
+├──────────────────────────────────────┤
+│  WHAT'S BEING WORKED ON NOW          │  (only when phase=running/paused)
+│  → [nextStep]                        │  FocusCard
+├──────────────────────────────────────┤
+│  STORY SO FAR                        │  EpisodeList
+│  ▾ Round 3 — Passed ✓               │
+│    What was built: ...               │
+│    Key decision: ...                 │
+│  ▾ Round 2 — Rejected ✗             │
+│    ...                               │
+├──────────────────────────────────────┤
+│  CHOICES & WHY                       │  DecisionNarrativeList
+│  The AI chose TypeScript over        │
+│  JavaScript because ...              │
+├──────────────────────────────────────┤
+│  OPEN QUESTIONS                      │  (only when uncertainties.length > 0)
+│  The AI flagged 2 open questions:    │  UncertaintyList
+│  • [item]                            │
+├──────────────────────────────────────┤
+│  QUALITY CHECK HISTORY               │  (only when judgeFeedback.length > 0)
+│  Round 3: ✗ Found an issue           │  JudgeNarrativeList
+│  Round 5: ✓ Passed                   │
+└──────────────────────────────────────┘
+```
+
+---
+
+#### 7.13.2 GoalCard
+
+**Source:** `progress.originalGoal`
+
+```tsx
+{progress?.originalGoal && (
+  <section className="narrative-section">
+    <div className="narrative-section-label">Project Goal</div>
+    <div className="narrative-goal-text">{progress.originalGoal}</div>
+  </section>
+)}
+```
+
+- If `originalGoal === null`: section not rendered (no placeholder).
+
+---
+
+#### 7.13.3 ProgressCard + ConfidenceBar
+
+**Source:** `loopState.iteration`, `loopState.maxIterations`, `progress.confidence`
+
+```tsx
+<section className="narrative-section">
+  <div className="narrative-section-label">Where We Are</div>
+  <div className="narrative-progress-row">
+    <span className="narrative-round-count">
+      Round {loopState.iteration} of {loopState.maxIterations}
+    </span>
+    {progress?.confidence !== null && (
+      <ConfidenceBar confidence={progress.confidence} />
+    )}
+  </div>
+</section>
+```
+
+**ConfidenceBar contract:**
+
+```tsx
+function ConfidenceBar({ confidence }: { confidence: number }) {
+  return (
+    <div className="confidence-bar-wrap">
+      <div className="confidence-bar-track">
+        <div
+          className="confidence-bar-fill"
+          style={{ width: `${confidence}%` }}
+        />
+      </div>
+      <div className="confidence-bar-label">
+        <span className="confidence-pct">{confidence}%</span>
+        <span className="confidence-text">{confidenceLabel(confidence)}</span>
+      </div>
+    </div>
+  );
+}
+```
+
+**`confidenceLabel(n: number): string`:**
+
+| Range | Label |
+|-------|-------|
+| 30–45 | `"Early stages — foundations being laid"` |
+| 46–60 | `"Making progress — core features taking shape"` |
+| 61–75 | `"More than halfway — major work completed"` |
+| 76–89 | `"Nearly complete — polishing and testing"` |
+| 90–100 | `"Complete — final verification underway"` |
+
+**CSS:**
+
+```css
+.confidence-bar-wrap   { display: flex; flex-direction: column; gap: 4px; flex: 1; }
+.confidence-bar-track  { height: 4px; background: var(--bg-3); border-radius: 2px; overflow: hidden; }
+.confidence-bar-fill   { height: 100%; background: var(--accent); transition: width 0.4s ease; }
+.confidence-bar-label  { display: flex; gap: 8px; align-items: baseline; }
+.confidence-pct        { font-size: 13px; font-weight: 700; color: var(--accent); font-family: var(--font-mono); }
+.confidence-text       { font-size: 11px; color: var(--text-2); }
+```
+
+---
+
+#### 7.13.4 FocusCard — What the AI Is Working on Now
+
+**Source:** `progress.nextStep`
+**Condition:** render only when `loopState?.phase === 'running' || loopState?.phase === 'paused'`
+
+```tsx
+{progress?.nextStep && (loopState?.phase === 'running' || loopState?.phase === 'paused') && (
+  <section className="narrative-section narrative-section--accent">
+    <div className="narrative-section-label">Working on now</div>
+    <div className="narrative-focus-text">
+      <span className="narrative-focus-arrow">→</span>
+      {progress.nextStep}
+    </div>
+  </section>
+)}
+```
+
+```css
+.narrative-section--accent { border-left: 2px solid var(--accent); padding-left: 10px; }
+.narrative-focus-text      { font-size: 13px; color: var(--text-0); display: flex; gap: 8px; align-items: flex-start; }
+.narrative-focus-arrow     { color: var(--accent); font-weight: 700; flex-shrink: 0; }
+```
+
+---
+
+#### 7.13.5 EpisodeList — Story So Far
+
+**Source:** `iterations[]` (from store), each with optional `progressSnapshot` and `gitCommits`
+
+Each `IterationItem` is one episode. Render newest-first.
+
+**Episode row contract:**
+
+```tsx
+function EpisodeRow({ item, feedback }: { item: IterationItem; feedback: JudgeFeedbackEntry[] }) {
+  const [expanded, setExpanded] = useState(false);
+  const roundFeedback = feedback.filter(f => f.iteration === item.iteration);
+  const wasRejected = roundFeedback.some(f => !f.approved);
+  const wasPassed   = roundFeedback.some(f =>  f.approved);
+
+  return (
+    <div className={`episode-row episode-row--${item.status}`}>
+      <button className="episode-header" onClick={() => setExpanded(v => !v)}>
+        <span className="episode-chevron">{expanded ? '▾' : '▸'}</span>
+        <span className="episode-title">Round {item.iteration}</span>
+        <span className={`episode-badge episode-badge--${wasPassed ? 'passed' : wasRejected ? 'failed' : item.status}`}>
+          {wasPassed ? '✓ Passed' : wasRejected ? '✗ Rejected' : item.status === 'active' ? '⟳ Running' : '—'}
+        </span>
+      </button>
+
+      {expanded && item.progressSnapshot && (
+        <div className="episode-body">
+          {item.progressSnapshot.completed.length > 0 && (
+            <div className="episode-field">
+              <div className="episode-field-label">What was built</div>
+              {item.progressSnapshot.completed.map((c, i) => (
+                <div key={i} className="episode-field-item">{c}</div>
+              ))}
+            </div>
+          )}
+
+          {item.progressSnapshot.decisions.length > 0 && (
+            <div className="episode-field">
+              <div className="episode-field-label">Key decision</div>
+              {item.progressSnapshot.decisions.slice(0, 1).map((d, i) => (
+                <div key={i} className="episode-field-item episode-field-item--decision">
+                  {decisionToSentence(d)}
+                </div>
+              ))}
+            </div>
+          )}
+
+          {roundFeedback.filter(f => !f.approved).map((fb, i) => (
+            <div key={i} className="episode-field episode-field--rejected">
+              <div className="episode-field-label">Quality check issue</div>
+              <div className="episode-field-item">{fb.summary || 'No details recorded.'}</div>
+            </div>
+          ))}
+        </div>
+      )}
+
+      {expanded && !item.progressSnapshot && (
+        <div className="episode-body episode-body--empty">No details recorded for this round.</div>
+      )}
+    </div>
+  );
+}
+```
+
+```css
+.episode-row         { border-bottom: 1px solid var(--border); }
+.episode-header      { width: 100%; display: flex; align-items: center; gap: 8px; padding: 8px 12px;
+                       background: none; border: none; cursor: pointer; text-align: left; }
+.episode-header:hover { background: var(--bg-hover); }
+.episode-chevron     { font-size: 10px; color: var(--text-3); width: 10px; flex-shrink: 0; }
+.episode-title       { font-size: 12px; color: var(--text-1); flex: 1; }
+.episode-badge       { font-size: 10px; font-weight: 600; padding: 1px 6px; border-radius: 3px; }
+.episode-badge--passed  { color: var(--green);  background: rgba(74,222,128,0.10); }
+.episode-badge--failed  { color: var(--red);    background: rgba(248,113,113,0.10); }
+.episode-badge--active  { color: var(--accent); background: rgba(16,217,160,0.10); }
+.episode-body        { padding: 4px 12px 12px 24px; display: flex; flex-direction: column; gap: 8px; }
+.episode-body--empty { font-size: 11px; color: var(--text-3); padding: 4px 12px 10px 24px; }
+.episode-field-label { font-size: 10px; font-weight: 700; text-transform: uppercase;
+                       letter-spacing: 0.06em; color: var(--text-3); margin-bottom: 2px; }
+.episode-field-item  { font-size: 12px; color: var(--text-1); line-height: 1.5; padding: 1px 0; }
+.episode-field-item--decision { color: var(--cyan); }
+.episode-field--rejected .episode-field-label { color: var(--red); }
+.episode-field--rejected .episode-field-item  { color: var(--text-2); }
+```
+
+---
+
+#### 7.13.6 DecisionNarrativeList — Choices & Why
+
+**Source:** `progress.decisions` (current progress, not snapshot — shows the full accumulated decisions)
+
+This is the most important section for non-developers. Every decision must be rendered as a complete sentence explaining:
+1. **What** was chosen
+2. **What the alternative was** (if any)
+3. **Why** this choice was made
+4. **When to revisit** (if specified)
+
+**`decisionToSentence(d: DecisionItem): string`** — authoritative function in `explainer.ts`:
+
+```typescript
+export function decisionToSentence(d: DecisionItem): string {
+  const chose    = d.chose.trim();
+  const rejected = d.rejected?.trim();
+  const reason   = d.reason?.trim();
+  const revisit  = d.revisitIf?.trim();
+
+  let sentence = '';
+
+  if (rejected) {
+    sentence = `**${chose}** was chosen over **${rejected}**`;
+  } else {
+    sentence = `The AI decided to use **${chose}**`;
+  }
+
+  if (reason) {
+    sentence += ` because ${reason}`;
+  }
+
+  sentence += '.';
+
+  if (revisit) {
+    sentence += ` This may be reconsidered if ${revisit}.`;
+  }
+
+  return sentence;
+}
+```
+
+**Rendering:**
+
+```tsx
+{progress?.decisions.length > 0 && (
+  <section className="narrative-section">
+    <div className="narrative-section-label">Choices & Why</div>
+    <div className="narrative-decisions">
+      {progress.decisions.map((d, i) => (
+        <div key={i} className="narrative-decision-card">
+          <div className="narrative-decision-chose">
+            <span className="narrative-decision-tag">Chose</span>
+            <span className="narrative-decision-value">{d.chose}</span>
+            {d.rejected && (
+              <>
+                <span className="narrative-decision-vs">over</span>
+                <span className="narrative-decision-rejected">{d.rejected}</span>
+              </>
+            )}
+          </div>
+          {d.reason && (
+            <div className="narrative-decision-reason">
+              <span className="narrative-decision-reason-icon">💡</span>
+              <span>{d.reason}</span>
+            </div>
+          )}
+          {d.revisitIf && (
+            <div className="narrative-decision-revisit">
+              Reconsider if: {d.revisitIf}
+            </div>
+          )}
+        </div>
+      ))}
+    </div>
+  </section>
+)}
+```
+
+```css
+.narrative-decisions          { display: flex; flex-direction: column; gap: 8px; }
+.narrative-decision-card      { background: var(--bg-2); padding: 10px 12px; border-left: 2px solid var(--cyan); }
+.narrative-decision-chose     { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; margin-bottom: 4px; }
+.narrative-decision-tag       { font-size: 9px; font-weight: 700; text-transform: uppercase;
+                                 color: var(--text-3); letter-spacing: 0.08em; }
+.narrative-decision-value     { font-size: 12px; font-weight: 600; color: var(--cyan); }
+.narrative-decision-vs        { font-size: 10px; color: var(--text-3); }
+.narrative-decision-rejected  { font-size: 12px; color: var(--text-2); text-decoration: line-through; }
+.narrative-decision-reason    { font-size: 11px; color: var(--text-1); display: flex; gap: 6px;
+                                 align-items: flex-start; line-height: 1.5; }
+.narrative-decision-reason-icon { flex-shrink: 0; }
+.narrative-decision-revisit   { font-size: 10px; color: var(--text-2); margin-top: 4px;
+                                 padding-top: 4px; border-top: 1px solid var(--border); }
+```
+
+**Invariants:**
+- Every decision must show `chose` + `reason` at minimum.
+- If `reason === null`: card still renders but omits the reason row (no empty `💡` line).
+- If `decisions.length === 0`: section not rendered.
+
+---
+
+#### 7.13.7 UncertaintyList — Open Questions
+
+**Source:** `progress.uncertainties`
+
+```tsx
+{progress?.uncertainties.length > 0 && (
+  <section className="narrative-section">
+    <div className="narrative-section-label">
+      Open Questions ({progress.uncertainties.length})
+    </div>
+    <div className="narrative-uncertainty-intro">
+      The AI flagged {progress.uncertainties.length === 1 ? 'this question' : 'these questions'} as unresolved:
+    </div>
+    {progress.uncertainties.map((item, i) => (
+      <div key={i} className="narrative-uncertainty-item">
+        <span className="narrative-uncertainty-bullet">?</span>
+        <span>{item}</span>
+      </div>
+    ))}
+  </section>
+)}
+```
+
+```css
+.narrative-uncertainty-intro  { font-size: 11px; color: var(--text-2); margin-bottom: 6px; }
+.narrative-uncertainty-item   { display: flex; gap: 8px; align-items: flex-start;
+                                 font-size: 12px; color: var(--text-1); padding: 3px 0; }
+.narrative-uncertainty-bullet { color: var(--yellow); font-weight: 700; flex-shrink: 0; width: 10px; }
+```
+
+---
+
+#### 7.13.8 JudgeNarrativeList — Quality Check History
+
+**Source:** `judgeFeedback[]`
+
+Render only when `judgeFeedback.length > 0`. Show newest first.
+
+```tsx
+{judgeFeedback.length > 0 && (
+  <section className="narrative-section">
+    <div className="narrative-section-label">Quality Check History</div>
+    {[...judgeFeedback].reverse().map((fb) => (
+      <div key={fb.id} className={`narrative-judge-row narrative-judge-row--${fb.approved ? 'passed' : 'failed'}`}>
+        <span className="narrative-judge-icon">{fb.approved ? '✓' : '✗'}</span>
+        <div className="narrative-judge-body">
+          <span className="narrative-judge-round">
+            {fb.iteration !== null ? `Round ${fb.iteration}` : 'Unknown round'}
+          </span>
+          <span className="narrative-judge-verdict">
+            {fb.approved ? 'Quality check passed.' : `Quality check flagged an issue${fb.summary ? ':' : '.'}`}
+          </span>
+          {!fb.approved && fb.summary && (
+            <span className="narrative-judge-summary">"{fb.summary}"</span>
+          )}
+        </div>
+      </div>
+    ))}
+  </section>
+)}
+```
+
+```css
+.narrative-judge-row          { display: flex; gap: 10px; align-items: flex-start; padding: 8px 0;
+                                 border-bottom: 1px solid var(--border); }
+.narrative-judge-row:last-child { border-bottom: none; }
+.narrative-judge-icon         { font-size: 13px; font-weight: 700; flex-shrink: 0; margin-top: 1px; }
+.narrative-judge-row--passed .narrative-judge-icon  { color: var(--green); }
+.narrative-judge-row--failed .narrative-judge-icon  { color: var(--red); }
+.narrative-judge-body         { display: flex; flex-direction: column; gap: 2px; }
+.narrative-judge-round        { font-size: 10px; font-weight: 700; color: var(--text-3); text-transform: uppercase; letter-spacing: 0.06em; }
+.narrative-judge-verdict      { font-size: 12px; color: var(--text-1); }
+.narrative-judge-summary      { font-size: 11px; color: var(--text-2); font-style: italic; line-height: 1.4; }
+```
+
+---
+
+#### 7.13.9 Empty State
+
+Shown when `progress === null` AND `iterations.length === 0`:
+
+```tsx
+<div className="memory-browser">
+  <div className="empty-state">
+    <div className="empty-state-text">Start a loop to see the project story here.</div>
+  </div>
+</div>
+```
+
+---
+
+#### 7.13.10 Full Component Shell
+
+```tsx
+// src/components/memory/MemoryBrowser.tsx
+export function MemoryBrowser() {
+  const { progress, iterations, judgeFeedback, loopState } = useStore();
+
+  const hasContent = progress || iterations.length > 0;
+
+  if (!hasContent) return <EmptyNarrativeState />;
+
+  // Sort episodes newest-first
+  const episodes = [...iterations].sort((a, b) => b.iteration - a.iteration);
+
+  return (
+    <div className="memory-browser narrative-memory">
+      <GoalCard             progress={progress} />
+      <ProgressCard         progress={progress} loopState={loopState} />
+      <FocusCard            progress={progress} loopState={loopState} />
+      <EpisodeList          episodes={episodes} feedback={judgeFeedback} />
+      <DecisionNarrativeList progress={progress} />
+      <UncertaintyList      progress={progress} />
+      <JudgeNarrativeList   feedback={judgeFeedback} />
+    </div>
+  );
+}
+```
+
+**CSS root:**
+
+```css
+.narrative-memory         { padding: 8px 0; }
+.narrative-section        { padding: 10px 12px; border-bottom: 1px solid var(--border); }
+.narrative-section:last-child { border-bottom: none; }
+.narrative-section-label  {
+  font-size: 10px; font-weight: 700; text-transform: uppercase;
+  letter-spacing: 0.08em; color: var(--text-3); margin-bottom: 6px;
+}
+.narrative-goal-text      { font-size: 13px; color: var(--text-0); line-height: 1.6; }
+.narrative-round-count    { font-size: 12px; color: var(--text-1); }
+.narrative-progress-row   { display: flex; flex-direction: column; gap: 6px; }
+```
+
+---
+
+#### 7.13.11 `explainer.ts` — Required New Exports
+
+Add these alongside existing exports. Do not remove existing functions.
+
+```typescript
+// NEW exports to add to src/lib/explainer.ts
+
+/** Convert a DecisionItem to a plain-English sentence. */
+export function decisionToSentence(d: DecisionItem): string { /* see §7.13.6 */ }
+
+/** Map a confidence number (30–100) to a plain-English label. */
+export function confidenceLabel(n: number): string { /* see §7.13.3 */ }
+```
+
+---
+
 ## 8. UI / Layout Specifications
 
 ### 8.1 Titlebar
@@ -1931,7 +2423,8 @@ All files that must be created or modified:
 | `src/components/monitor/LoopMonitor.tsx` | Modify | SessionReport per §7.5; render `QuestionPromptOverlay` |
 | `src/components/monitor/QuestionPromptOverlay.tsx` | **New** | Full implementation per §7.8 |
 | `src/components/projects/ProjectList.tsx` | Modify | Completed project history view per §7.6 |
-| `src/components/memory/MemoryBrowser.tsx` | Modify | `JudgeEvolutionLog` section per §7.7 |
+| `src/components/memory/MemoryBrowser.tsx` | **Rewrite** | Narrative panel per §7.13; `JudgeEvolutionLog` at bottom per §7.7 |
+| `src/lib/explainer.ts` | Modify | Add `decisionToSentence()`, `confidenceLabel()` (§7.13.11) |
 | `src/components/layout/RightPanel.tsx` | Modify | Vertical activity bar per §8.2; raw log tab for `advancedMode` |
 | `src/components/layout/Titlebar.tsx` | Modify | Icon-only buttons per §8.1 |
 | `src/components/projects/ProjectCard.tsx` | Modify | Tree row pattern per §8.3 |
@@ -2222,6 +2715,61 @@ Every item must pass before the feature is considered complete.
          (it may remain in session persistence only)
 ```
 
+### Narrative Memory Panel (§7.13)
+
+```
+[ ] N1.  GoalCard renders progress.originalGoal text when non-null;
+         section is absent when originalGoal === null
+
+[ ] N2.  ConfidenceBar: confidence=72 → bar fill width=72%; label="More than halfway — major work completed"
+
+[ ] N3.  ConfidenceBar: confidence=null → entire ConfidenceBar not rendered (no 0% placeholder)
+
+[ ] N4.  FocusCard visible only when phase=running or phase=paused AND nextStep is non-null;
+         not rendered when phase=completed, cancelled, or idle
+
+[ ] N5.  EpisodeList renders newest iteration first (highest iteration number at top)
+
+[ ] N6.  Collapsed episode row shows round number and badge only; no body content in DOM
+
+[ ] N7.  Episode with wasPassed=true → badge text "✓ Passed", badge class episode-badge--passed
+
+[ ] N8.  Episode with wasRejected=true AND wasPassed=false → badge text "✗ Rejected", class episode-badge--failed
+
+[ ] N9.  Episode with no judgeFeedback entries → badge text "—"
+
+[ ] N10. Episode expanded + progressSnapshot exists → "What was built" section shows
+         snapshot.completed items; "Key decision" shows first decision as decisionToSentence()
+
+[ ] N11. Episode expanded + progressSnapshot === undefined → "No details recorded for this round." shown
+
+[ ] N12. DecisionNarrativeList: decision with chose="TypeScript", rejected="JavaScript", reason="type safety"
+         → card renders "TypeScript" (cyan, weight 600) + strikethrough "JavaScript" + reason text
+
+[ ] N13. DecisionNarrativeList: decision with reason=null → reason row absent (no empty 💡 line)
+
+[ ] N14. DecisionNarrativeList: decisions.length===0 → "Choices & Why" section not rendered
+
+[ ] N15. decisionToSentence({chose:"React", rejected:"Vue", reason:"ecosystem", revisitIf:null})
+         → "**React** was chosen over **Vue** because ecosystem."
+         (implementation may omit markdown bold — plain text form also acceptable in UI)
+
+[ ] N16. UncertaintyList: uncertainties=["X","Y"] → intro text "The AI flagged these questions as unresolved:"
+         + 2 items each with "?" bullet in var(--yellow)
+
+[ ] N17. UncertaintyList: uncertainties.length===0 → "Open Questions" section not rendered
+
+[ ] N18. JudgeNarrativeList: approved entry → "✓" icon (var(--green)) + "Quality check passed."
+
+[ ] N19. JudgeNarrativeList: rejected entry with summary → "✗" icon (var(--red))
+         + verdict text + summary in italic below
+
+[ ] N20. JudgeNarrativeList: judgeFeedback.length===0 → "Quality Check History" section not rendered
+
+[ ] N21. Empty state (progress===null AND iterations.length===0) →
+         "Start a loop to see the project story here." — no other content
+```
+
 ### Build Verification
 
 ```
@@ -2242,7 +2790,7 @@ Every item must pass before the feature is considered complete.
 
 ### Blocked / Needs Clarification
 
-0. **Episodic memory watcher** — The current watcher covers 5 files. If gulf-loop writes additional memory files (e.g., `.claude/memory/*.md` wiki, episodic session logs), the watcher and `MemoryBrowser` need to be extended. **Requires**: confirmation of the exact file paths and format used by gulf-loop's structured memory feature (`structured_memory: true`). Once confirmed, add a 6th watch target to `start_watcher` and a new `memory-changed` event handler.
+0. **Structured memory wiki watcher** (`structured_memory: true`) — If gulf-loop writes `.claude/memory/*.md` wiki files, the watcher and `MemoryBrowser` need a new watch target and `memory-wiki-changed` event. The narrative panel (§7.13) would show a "Knowledge Base" section. **Requires**: confirmation of exact file paths and format used when `structured_memory: true`. Until confirmed, §7.13 covers the existing 5-file data sources only.
 
 ### High Priority
 
