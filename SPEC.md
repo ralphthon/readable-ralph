@@ -2198,6 +2198,152 @@ export function confidenceLabel(n: number): string { /* see §7.13.3 */ }
 
 ---
 
+### 7.14 Terminal Output Persistence Per Project
+
+**Problem:** The xterm.js terminal is a single shared instance. When the user closes and reopens the terminal panel, or switches between projects, the output is lost — xterm's internal scrollback is cleared on `reset()`. There is no way to recover what Claude printed.
+
+**Solution:** A per-project output buffer in the store that captures every PTY chunk. On project switch or panel reopen, replay the buffer into xterm instead of starting blank.
+
+---
+
+#### 7.14.1 Buffer Store (settingsSlice or new terminalSlice)
+
+```typescript
+// Add to store — keyed by projectId
+interface TerminalBufferSlice {
+  terminalBuffers: Record<string, string[]>;  // projectId → ordered chunks
+  bufferAdd:    (projectId: string, chunk: string) => void;
+  bufferReplay: (projectId: string) => string[];  // returns chunks in order
+  bufferClear:  (projectId: string) => void;
+}
+```
+
+**Buffer cap:** maximum **1000 chunks per project**. When full, drop the oldest chunk before appending (ring buffer semantics):
+
+```typescript
+bufferAdd: (projectId, chunk) => set(state => {
+  const existing = state.terminalBuffers[projectId] ?? [];
+  const next = existing.length >= 1000
+    ? [...existing.slice(1), chunk]
+    : [...existing, chunk];
+  return { terminalBuffers: { ...state.terminalBuffers, [projectId]: next } };
+}),
+```
+
+**`bufferReplay`** returns the stored array; the caller writes each chunk to xterm in sequence.
+
+---
+
+#### 7.14.2 Three Integration Points
+
+**Point 1 — On output received (`claude-output` listener in App.tsx):**
+
+Capture every chunk before writing to xterm. The `activeProjectId` at the time of the event is the key.
+
+```typescript
+listen<{ project_id: string; data: string }>('claude-output', (event) => {
+  const { project_id, data } = event.payload;
+
+  // 1. Buffer first
+  useStore.getState().bufferAdd(project_id, data);
+
+  // 2. Then write to terminal (only if it's the active project)
+  if (project_id === useStore.getState().activeProjectId) {
+    terminalRef.current?.write(data);
+  }
+});
+```
+
+**Point 2 — On project switch (when `activeProjectId` changes):**
+
+Reset xterm and replay the buffer for the newly selected project:
+
+```typescript
+// Called wherever activeProjectId is updated (ProjectList click handler or store action)
+function onProjectSwitch(newProjectId: string) {
+  setActiveProject(newProjectId, project.path);
+  const term = terminalRef.current;
+  if (!term) return;
+
+  term.reset();  // clear current display
+
+  const chunks = useStore.getState().bufferReplay(newProjectId);
+  for (const chunk of chunks) {
+    term.write(chunk);
+  }
+}
+```
+
+**Point 3 — On session dead (`claude-session-dead` event):**
+
+Append a dim visual separator to the buffer so the user can see where the session ended when they reopen the panel:
+
+```typescript
+listen<{ project_id: string }>('claude-session-dead', (event) => {
+  const separator = '\r\n\x1b[2m--- session ended ---\x1b[0m\r\n';
+  useStore.getState().bufferAdd(event.payload.project_id, separator);
+
+  // Write to terminal immediately if this is the active project
+  if (event.payload.project_id === useStore.getState().activeProjectId) {
+    terminalRef.current?.write(separator);
+  }
+});
+```
+
+`\x1b[2m` = dim text, `\x1b[0m` = reset. The separator is stored as a regular chunk so it appears on replay.
+
+---
+
+#### 7.14.3 Terminal Panel Reopen
+
+When `showTerminal` toggles from `false` → `true` and the terminal component mounts (or becomes visible), replay the buffer for the active project:
+
+```typescript
+// In the terminal component — useEffect on mount / visibility change
+useEffect(() => {
+  if (!showTerminal || !terminalRef.current) return;
+  const projectId = useStore.getState().activeProjectId;
+  if (!projectId) return;
+
+  const term = terminalRef.current;
+  term.reset();
+  const chunks = useStore.getState().bufferReplay(projectId);
+  for (const chunk of chunks) {
+    term.write(chunk);
+  }
+}, [showTerminal]);
+```
+
+---
+
+#### 7.14.4 Buffer Lifecycle
+
+| Event | Action |
+|-------|--------|
+| New session spawned (`spawn_and_send` / `spawn_claude`) | `bufferClear(projectId)` — start fresh |
+| PTY output chunk received | `bufferAdd(projectId, chunk)` |
+| Session dead | `bufferAdd(projectId, separator)` |
+| Project deleted | `bufferClear(projectId)` |
+| `resetLoop()` called | `bufferClear(activeProjectId)` |
+
+**Buffer is NOT cleared on:**
+- Terminal panel close/reopen
+- Project switch (buffer must survive to replay on switch-back)
+- App minimize/restore
+
+---
+
+#### 7.14.5 File Scope
+
+| File | Change |
+|------|--------|
+| `src/store/settingsSlice.ts` (or new `terminalSlice.ts`) | Add `terminalBuffers`, `bufferAdd`, `bufferReplay`, `bufferClear` |
+| `src/App.tsx` | `claude-output` listener calls `bufferAdd`; `claude-session-dead` appends separator |
+| `src/components/layout/TerminalPanel.tsx` (or equivalent) | `useEffect` on mount/show calls `bufferReplay` + writes chunks to xterm |
+| `src/components/projects/ProjectList.tsx` | `onProjectSwitch` calls `term.reset()` + `bufferReplay` |
+
+---
+
 ## 8. UI / Layout Specifications
 
 ### 8.1 Titlebar
@@ -2412,7 +2558,7 @@ All files that must be created or modified:
 | `src/types/loop.ts` | Modify | `ActivityEventType`, `ActivityEvent`, `ProgressSnapshot` types |
 | `src/store/loopSlice.ts` | Modify | `rawProgressContent`, `activityEvents`, `addActivityEvent`; update `setProgress` signature; ActivityEvent generation logic in `setLoopState`, `setJudgeFeedback` |
 | `src/store/settingsSlice.ts` | Modify | `activeQuestion`, `setActiveQuestion` |
-| `src/App.tsx` | Modify | Update `setProgress(parsed, raw)` call; add `judge-evolution-changed` listener if missing |
+| `src/App.tsx` | Modify | Update `setProgress(parsed, raw)` call; add `judge-evolution-changed` listener if missing; `claude-output` listener calls `bufferAdd`; `claude-session-dead` appends separator (§7.14.2) |
 | `src/lib/state-parser.ts` | Verify | Ensure phase derivation matches spec §3.1 |
 | `src/lib/progress-parser.ts` | Verify/Modify | Ensure `ORIGINAL_GOAL`, `ITERATION`, `revisit_if` fields are extracted; ensure `CONFIDENCE` clamping |
 | `src/lib/rubric-generator.ts` | Modify | Default `maxIterations=50`, anti-early-completion instructions |
@@ -2428,7 +2574,9 @@ All files that must be created or modified:
 | `src/components/layout/RightPanel.tsx` | Modify | Vertical activity bar per §8.2; raw log tab for `advancedMode` |
 | `src/components/layout/Titlebar.tsx` | Modify | Icon-only buttons per §8.1 |
 | `src/components/projects/ProjectCard.tsx` | Modify | Tree row pattern per §8.3 |
-| `src/styles/globals.css` | Modify | Add: `snapshot-*`, `activity-event-*`, `result-stat-*`, `question-*`, `tree-row-*`, `activity-tab`, `right-panel-activity-bar` classes |
+| `src/styles/globals.css` | Modify | Add: `snapshot-*`, `activity-event-*`, `result-stat-*`, `question-*`, `tree-row-*`, `activity-tab`, `right-panel-activity-bar`, `narrative-*`, `confidence-bar-*`, `episode-*` classes |
+| `src/store/settingsSlice.ts` (or `terminalSlice.ts`) | Modify | `terminalBuffers`, `bufferAdd`, `bufferReplay`, `bufferClear` (§7.14.1) |
+| `src/components/layout/TerminalPanel.tsx` | Modify | `useEffect` mount/show → `bufferReplay` + write to xterm (§7.14.3) |
 | `src/lib/cost-calculator.ts` | Modify | Delete `formatElapsedMinutes`; keep `estimateCostKrw`, `formatCostKrw` (§7.12.4) |
 | `src/components/monitor/TokenUsageCard.tsx` | Modify | Add 30s interval for live re-render (§7.12.3); null guards per §7.12.5 |
 | `src/components/monitor/LoopMonitor.tsx` | Modify | SessionReport stats row: add Elapsed + Est. cost cards (§7.12.6) |
@@ -2713,6 +2861,31 @@ Every item must pass before the feature is considered complete.
 
 [ ] C11. loopStartTimeMs is not used as a display source anywhere in the UI
          (it may remain in session persistence only)
+```
+
+### Terminal Persistence (§7.14)
+
+```
+[ ] X1.  After loop produces output, close the terminal panel and reopen it →
+         all previously seen output is visible again (no blank terminal)
+
+[ ] X2.  Switch to a different project and back → original project's terminal
+         output is restored (term.reset() + bufferReplay called on switch)
+
+[ ] X3.  claude-session-dead fires → "--- session ended ---" appears in dim text
+         at the bottom of the terminal; visible on next replay
+
+[ ] X4.  bufferAdd respects 1000-chunk cap: inject 1001 chunks → oldest chunk
+         is dropped; bufferReplay returns exactly 1000 chunks
+
+[ ] X5.  spawn_and_send (new session) → previous buffer for that projectId is
+         cleared (bufferClear called before spawn); old output not shown
+
+[ ] X6.  resetLoop() → bufferClear(activeProjectId) is called;
+         terminal panel shows blank after reset
+
+[ ] X7.  PTY output for non-active project → chunk stored in buffer but NOT
+         written to xterm (no cross-project terminal bleed)
 ```
 
 ### Narrative Memory Panel (§7.13)
