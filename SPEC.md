@@ -53,7 +53,8 @@ return showWizard       ? <GoalWizard />
 | `detect_project_type` | `(path) -> String` | `webapp\|cli\|script\|other` |
 | `get_settings` | `() -> RalphSettings` | |
 | `save_settings` | `(settings) -> Result<()>` | |
-| `spawn_claude` | `(app, projectId, projectPath, cols, rows) -> Result<()>` | |
+| `spawn_claude` | `(app, projectId, projectPath, cols, rows) -> Result<()>` | standalone spawn, no command |
+| `spawn_and_send` | `(app, projectId, projectPath, command, cols, rows) -> Result<()>` | spawn + `tokio::sleep(8s)` + write; returns after send |
 | `send_command` | `(projectId, data) -> Result<()>` | raw PTY write |
 | `send_command_enter` | `(projectId, data) -> Result<()>` | write + `\r\n` |
 | `kill_claude` | `(projectId) -> Result<()>` | |
@@ -1291,50 +1292,69 @@ await invoke('send_command_enter', { projectId, data: `/gulf-loop:start "${singl
 
 ### 7.11 PTY Command Timing & Gate Fixes
 
-#### 7.11.1 Command Timing — Wait for Actual Output (QuickRestartView, GoalWizard)
+#### 7.11.1 Command Timing — Single `spawn_and_send` Backend Command
 
-**Problem:** A fixed 5-second sleep before sending the loop command is insufficient when Claude takes longer to start, and wasteful when it starts quickly.
+**Problem:** The previous approach (frontend listener + `setTimeout` + hard timeout) requires:
+- Managing a one-shot `claude-output` listener across potential component unmounts
+- Two separate `invoke` calls with a timing gap between them
+- Risk of memory leaks if the component unmounts before the timer fires
 
-**Required behavior:**
+**Solution:** Replace the two-step spawn + send with a single Tauri command that handles both atomically in the backend.
 
-1. After `spawn_claude(...)`, subscribe to the `claude-output` event **for the current `projectId`**.
-2. On the **first** `claude-output` event received for this project, wait **2 000 ms**, then send the loop command via `send_command_enter`.
-3. If no `claude-output` is received within **12 000 ms** of spawning, send the command anyway (hard fallback).
-4. Unsubscribe from `claude-output` after the command is sent (one-shot listener).
+**New Tauri command:**
 
-```typescript
-// Pseudocode for QuickRestartView / GoalWizard command dispatch
-async function startLoop(projectId: string, projectPath: string, prompt: string) {
-  await invoke('spawn_claude', { projectId, projectPath, cols: 220, rows: 50 });
+```rust
+// src-tauri/src/lib.rs
+#[tauri::command]
+async fn spawn_and_send(
+    app: AppHandle,
+    project_id: String,
+    project_path: String,
+    command: String,   // already-flattened single-line string
+    cols: u16,
+    rows: u16,
+) -> Result<(), String> {
+    // 1. Spawn Claude PTY session
+    spawn_claude_inner(&app, &project_id, &project_path, cols, rows).await?;
 
-  let sent = false;
+    // 2. Wait for Claude to be ready — non-blocking tokio sleep
+    tokio::time::sleep(std::time::Duration::from_secs(8)).await;
 
-  const sendCommand = async () => {
-    if (sent) return;
-    sent = true;
-    unlistenOutput?.();
-    clearTimeout(hardTimeout);
-    const cmd = buildFlatCommand(prompt);   // flattened single-line string
-    await invoke('send_command_enter', { projectId, data: cmd });
-  };
+    // 3. Write command + \r as a single atomic write
+    send_command_enter_inner(&project_id, &command).await?;
 
-  const unlistenOutput = await listen<{ project_id: string; data: string }>(
-    'claude-output',
-    (event) => {
-      if (event.payload.project_id !== projectId) return;
-      setTimeout(sendCommand, 2_000);   // 2s after first output
-    }
-  );
-
-  // Hard fallback: 12s after spawn
-  const hardTimeout = setTimeout(sendCommand, 12_000);
+    Ok(())
 }
 ```
 
+**Why `tokio::time::sleep` not `std::thread::sleep`:**
+- `std::thread::sleep` blocks the Tauri/tokio worker thread, preventing other async tasks from running during the wait.
+- `tokio::time::sleep` yields the thread back to the executor — other events (PTY output, file watch) continue processing normally during the 8s wait.
+
+**Frontend call site (QuickRestartView, GoalWizard):**
+
+```typescript
+// Before: two invokes + listener management
+await invoke('spawn_claude', { projectId, projectPath, cols: 220, rows: 50 });
+// ... complex listener/timer setup ...
+await invoke('send_command_enter', { projectId, data: cmd });
+
+// After: single invoke, no listener or timer on the frontend
+const cmd = buildFlatCommand(prompt);  // flatten \n → space
+await invoke('spawn_and_send', {
+  projectId,
+  projectPath,
+  command: cmd,
+  cols: 220,
+  rows: 50,
+});
+```
+
 **Invariants:**
-- `sendCommand` is idempotent — called at most once regardless of how many `claude-output` events arrive.
-- The hard timeout is always cleared if `sendCommand` fires from the output listener.
-- The output listener is always unsubscribed after `sendCommand` runs.
+- The 8-second wait happens entirely in the Rust async runtime — the frontend `invoke` call returns only after the command has been written to the PTY.
+- No frontend `setTimeout`, `clearTimeout`, or `unlisten` is needed for loop start.
+- Component unmount during the 8s window does not cause a double-send or leak — the backend completes independently.
+- `spawn_claude` (standalone) remains available for cases that do not immediately send a command (e.g., terminal-only mode).
 
 ---
 
@@ -1620,8 +1640,9 @@ All files that must be created or modified:
 | `src-tauri/src/watcher/mod.rs` | Verify | Confirm `JUDGE_EVOLUTION.md` → `judge-evolution-changed` is implemented |
 | `src-tauri/src/process/mod.rs` | Modify | `detect_question_block`, `QuestionBlock` struct, emit `claude-question-prompt` |
 | `src/lib/rubric-generator.ts` | Modify | Flatten multi-line prompt (§7.10); defaults `maxIterations=50`, `milestoneEvery=0` |
-| `src/components/projects/QuickRestartView.tsx` | Modify | Output-triggered timing (§7.11.1); flatten prompt before send |
-| `src/components/wizard/GoalWizard.tsx` | Modify | Output-triggered timing (§7.11.1); flatten prompt before send |
+| `src-tauri/src/lib.rs` | Modify | Add `spawn_and_send` command (§7.11.1) |
+| `src/components/projects/QuickRestartView.tsx` | Modify | Replace spawn+listener with `invoke('spawn_and_send', ...)` (§7.11.1); flatten prompt |
+| `src/components/wizard/GoalWizard.tsx` | Modify | Replace spawn+listener with `invoke('spawn_and_send', ...)` (§7.11.1); flatten prompt |
 | `src/components/monitor/MilestoneGate.tsx` | Modify | Add `projectId`; use `send_command_enter` (§7.11.2, §7.11.3) |
 | `src/components/monitor/HITLGate.tsx` | Modify | Unify to `send_command_enter` with `projectId` (§7.11.3) |
 
@@ -1816,14 +1837,17 @@ Every item must pass before the feature is considered complete.
 [ ] G1.  buildGulfLoopPrompt output has all \n replaced with space before PTY send
          — verify: the string passed to send_command_enter contains no \n or \r
 
-[ ] G2.  After spawn_claude, command is NOT sent immediately (no fixed sleep)
+[ ] G2.  QuickRestartView and GoalWizard call invoke('spawn_and_send') — NOT
+         invoke('spawn_claude') followed by a separate invoke('send_command_enter')
 
-[ ] G3.  After first claude-output event for the project → command sent after exactly 2 000ms
+[ ] G3.  No frontend setTimeout, clearTimeout, or claude-output listener is created
+         during loop start (verify: no listen('claude-output') call in start handlers)
 
-[ ] G4.  If no claude-output within 12 000ms → command sent anyway (hard fallback)
+[ ] G4.  spawn_and_send uses tokio::time::sleep (not std::thread::sleep) — verify
+         by confirming other PTY output events still arrive during the 8s wait
 
-[ ] G5.  sendCommand is idempotent: called at most once per loop start even if
-         multiple claude-output events arrive before the 2s delay expires
+[ ] G5.  Component unmount during 8s wait does not cause double-send or JS error
+         (the invoke Promise may resolve after unmount — must be handled safely)
 
 [ ] G6.  MilestoneGate "Resume" button calls invoke('send_command_enter', { projectId, data })
          — projectId must NOT be undefined or empty string
