@@ -2780,7 +2780,8 @@ Every item must pass before the feature is considered complete.
 
 ```
 [ ] G1.  buildGulfLoopPrompt output has all \n replaced with space before PTY send
-         — verify: the string passed to send_command_enter contains no \n or \r
+         — verify: the `command` argument passed to invoke('spawn_and_send') contains no \n or \r
+         (the flat prompt goes to spawn_and_send, NOT to send_command_enter)
 
 [ ] G2.  QuickRestartView and GoalWizard call invoke('spawn_and_send') — NOT
          invoke('spawn_claude') followed by a separate invoke('send_command_enter')
@@ -2789,7 +2790,8 @@ Every item must pass before the feature is considered complete.
          during loop start (verify: no listen('claude-output') call in start handlers)
 
 [ ] G4.  spawn_and_send uses tokio::time::sleep (not std::thread::sleep) — verify
-         by confirming other PTY output events still arrive during the 8s wait
+         by confirming PTY output events (claude-output) still arrive during the
+         streaming wait period; these events are required for readiness detection
 
 [ ] G5.  Component unmount during 8s wait does not cause double-send or JS error
          (the invoke Promise may resolve after unmount — must be handled safely)
@@ -2808,8 +2810,8 @@ Every item must pass before the feature is considered complete.
 [ ] G11. setActiveProject(projectId, projectPath) is called synchronously BEFORE
          invoke('start_watcher') and invoke('spawn_and_send') in QuickRestartView and GoalWizard
 
-[ ] G12. While spawn_and_send is awaiting (8s), loop-state-changed events are routed
-         to the correct project (verify: activeProjectId is non-null during the wait)
+[ ] G12. While spawn_and_send is in the streaming wait, loop-state-changed events are
+         routed to the correct project (verify: activeProjectId is non-null during the wait)
 
 [ ] G13. send_command_enter writes "{data}\r" as a single write_all call — no \n appended,
          no two separate writes
@@ -2913,6 +2915,9 @@ Every item must pass before the feature is considered complete.
 
 [ ] N10. Episode expanded + progressSnapshot exists → "What was built" section shows
          snapshot.completed items; "Key decision" shows first decision as decisionToSentence()
+
+[ ] N10b. Episode expanded + REJECTED judgeFeedback exists for that iteration →
+          "Quality check issue" field shown with fb.summary text; label in var(--red)
 
 [ ] N11. Episode expanded + progressSnapshot === undefined → "No details recorded for this round." shown
 
