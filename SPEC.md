@@ -1299,19 +1299,65 @@ await invoke('send_command_enter', { projectId, data: `/gulf-loop:start "${singl
 
 ### 7.11 PTY Command Timing & Gate Fixes
 
-#### 7.11.1 Command Timing — Single `spawn_and_send` Backend Command
+#### 7.11.1 Command Timing — Streaming-Ready Detection + 2-Phase Send
 
-**Problem:** The previous approach (frontend listener + `setTimeout` + hard timeout) requires:
-- Managing a one-shot `claude-output` listener across potential component unmounts
-- Two separate `invoke` calls with a timing gap between them
-- Risk of memory leaks if the component unmounts before the timer fires
+**Root cause (confirmed):** Two independent bugs:
+1. **Fixed 8s sleep is unreliable** — MCP server loading can take longer; Claude may not yet be at the `>` prompt when the command arrives → command ignored.
+2. **Atomic `command+\r` write breaks ink TUI** — Claude Code (ink/React TUI) processes PTY input as a "large paste". Sending `command\r` as a single `write_all` means `\r` arrives while the TUI is still processing the paste buffer → Enter is not registered and the command is never submitted.
 
-**Solution:** Replace the two-step spawn + send with a single Tauri command that handles both atomically in the backend.
+**Solution:** Two coordinated changes — stream-based readiness detection in `process/mod.rs`, and 2-phase send in `spawn_and_send`.
 
-**New Tauri command:**
+---
+
+**Change A — `ClaudeProcess` ready flag (`src-tauri/src/process/mod.rs`):**
 
 ```rust
-// src-tauri/src/lib.rs
+use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
+
+pub struct ClaudeProcess {
+    // existing fields ...
+    pub ready: Arc<AtomicBool>,   // NEW: true once Claude prompt is detected
+}
+```
+
+The PTY reader thread already emits `claude-output` chunks. Extend it to also call `is_claude_prompt()` on each chunk:
+
+```rust
+// Inside the reader thread, after emitting claude-output:
+let clean = strip_ansi(&chunk_str);
+if !session.ready.load(Ordering::Relaxed) && is_claude_prompt(&clean) {
+    session.ready.store(true, Ordering::Relaxed);
+}
+```
+
+**Helper functions:**
+
+```rust
+/// Strip ANSI escape sequences (ESC [ ... m / ESC [ ... H etc.)
+fn strip_ansi(s: &str) -> String {
+    // regex: \x1b\[[0-9;]*[A-Za-z]
+    // or use the `strip-ansi-escapes` crate
+}
+
+/// Detect Claude Code's interactive prompt
+fn is_claude_prompt(s: &str) -> bool {
+    s.contains("> ") || s.contains("❯ ") || s.contains("\n>")
+}
+
+/// Public API for spawn_and_send to poll
+pub fn is_session_ready(project_id: &str) -> bool {
+    let sessions = SESSIONS.lock().unwrap();
+    sessions.get(project_id).map(|s| s.ready.load(Ordering::Relaxed)).unwrap_or(false)
+}
+```
+
+**Reset:** `ready` is reset to `false` when a new session is spawned (in `spawn_claude_inner`).
+
+---
+
+**Change B — Streaming wait + 2-phase send (`src-tauri/src/lib.rs`):**
+
+```rust
 #[tauri::command]
 async fn spawn_and_send(
     app: AppHandle,
@@ -1324,29 +1370,67 @@ async fn spawn_and_send(
     // 1. Spawn Claude PTY session
     spawn_claude_inner(&app, &project_id, &project_path, cols, rows).await?;
 
-    // 2. Wait for Claude to be ready — non-blocking tokio sleep
-    tokio::time::sleep(std::time::Duration::from_secs(8)).await;
+    // 2. Stream-based readiness wait
+    //    - Minimum 3s (prevents false positives from early partial output)
+    //    - 300ms polling interval
+    //    - +300ms buffer after ready signal (TUI fully settled)
+    //    - 15s hard timeout fallback
+    let start = std::time::Instant::now();
+    let min_wait   = std::time::Duration::from_secs(3);
+    let buffer     = std::time::Duration::from_millis(300);
+    let hard_limit = std::time::Duration::from_secs(15);
+    let poll       = std::time::Duration::from_millis(300);
 
-    // 3. Write command + \r as a single atomic write
-    send_command_enter_inner(&project_id, &command).await?;
+    loop {
+        tokio::time::sleep(poll).await;
+        let elapsed = start.elapsed();
+
+        if elapsed >= hard_limit {
+            break;  // proceed anyway (best-effort fallback)
+        }
+        if elapsed >= min_wait && is_session_ready(&project_id) {
+            tokio::time::sleep(buffer).await;  // settle buffer
+            break;
+        }
+    }
+
+    // 3. Verify session is still alive (auth failure, early exit)
+    if !is_session_active_inner(&project_id) {
+        return Err(format!("Session {} exited before command could be sent", project_id));
+    }
+
+    // 4. Phase 1: write command text (PTY input buffer — treated as paste)
+    let mut sessions = SESSIONS.lock().map_err(|e| e.to_string())?;
+    let session = sessions.get_mut(&project_id)
+        .ok_or_else(|| format!("No session for {}", project_id))?;
+    session.writer.write_all(command.as_bytes())
+        .map_err(|e| e.to_string())?;
+    drop(sessions);  // release lock before sleep
+
+    // 5. Phase 2: wait for TUI to process paste, then send Enter
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+    let mut sessions = SESSIONS.lock().map_err(|e| e.to_string())?;
+    let session = sessions.get_mut(&project_id)
+        .ok_or_else(|| format!("No session for {}", project_id))?;
+    session.writer.write_all(b"\r")
+        .map_err(|e| e.to_string())?;
 
     Ok(())
 }
 ```
 
-**Why `tokio::time::sleep` not `std::thread::sleep`:**
-- `std::thread::sleep` blocks the Tauri/tokio worker thread, preventing other async tasks from running during the wait.
-- `tokio::time::sleep` yields the thread back to the executor — other events (PTY output, file watch) continue processing normally during the 8s wait.
+**Why 2-phase send:**
+- Claude Code (ink) processes PTY input as keyboard events. When `command\r` arrives as one chunk, the ink event loop receives characters and Enter simultaneously. Large commands are processed as "paste" — the `\r` can be consumed by the paste handler before the command text is fully inserted into the input buffer.
+- Sending command text first → 500ms pause → `\r` separately ensures the ink input field has fully processed all characters before Enter is delivered.
 
-**Frontend call site (QuickRestartView, GoalWizard):**
+**Why `tokio::time::sleep` not `std::thread::sleep`:**
+- `std::thread::sleep` blocks the Tauri worker thread entirely. PTY reader threads, file watch events, and other Tauri commands cannot proceed during the wait.
+- `tokio::time::sleep` yields the executor — PTY output continues streaming (needed for readiness detection), file watch events fire normally, and other commands remain responsive.
+
+**Frontend call site (QuickRestartView, GoalWizard) — unchanged:**
 
 ```typescript
-// Before: two invokes + listener management
-await invoke('spawn_claude', { projectId, projectPath, cols: 220, rows: 50 });
-// ... complex listener/timer setup ...
-await invoke('send_command_enter', { projectId, data: cmd });
-
-// After: single invoke, no listener or timer on the frontend
 const cmd = buildFlatCommand(prompt);  // flatten \n → space
 await invoke('spawn_and_send', {
   projectId,
@@ -1358,10 +1442,10 @@ await invoke('spawn_and_send', {
 ```
 
 **Invariants:**
-- The 8-second wait happens entirely in the Rust async runtime — the frontend `invoke` call returns only after the command has been written to the PTY.
-- No frontend `setTimeout`, `clearTimeout`, or `unlisten` is needed for loop start.
-- Component unmount during the 8s window does not cause a double-send or leak — the backend completes independently.
-- `spawn_claude` (standalone) remains available for cases that do not immediately send a command (e.g., terminal-only mode).
+- The entire wait + 2-phase send happens in the Rust async runtime. The frontend `invoke` returns only after `\r` has been written.
+- No frontend `setTimeout`, `clearTimeout`, or `listen('claude-output')` needed for loop start.
+- `spawn_claude` (standalone, no command) remains available for terminal-only mode.
+- Component unmount during the wait does not cause a double-send — the backend completes independently of the frontend lifecycle.
 
 ---
 
@@ -1460,29 +1544,26 @@ const startLoop = async () => {
 
 ---
 
-#### 7.11.5 Enter Key Not Delivered — `send_command_enter` Diagnosis
+#### 7.11.5 Enter Key Not Delivered — Confirmed Root Cause & Fix
 
-**Symptom:** The gulf-loop slash command is sent to the PTY but Claude does not execute it — as if the Enter key was never received.
+**Root cause (confirmed):** Claude Code uses ink (React TUI). When the PTY receives `command\r` as a single `write_all`, the ink event loop processes this as a "large paste" operation. During paste processing, `\r` arrives while the command text is still being inserted into the input buffer — ink's paste handler consumes the carriage return as part of the paste, and the command is never submitted.
 
-**Known causes to check (in order):**
+**Fix:** The 2-phase send in `spawn_and_send` (§7.11.1) resolves this:
+- Phase 1: `write_all(command.as_bytes())` — command text only, no `\r`
+- 500ms sleep — ink TUI processes all pasted characters
+- Phase 2: `write_all(b"\r")` — Enter delivered after paste is fully processed
 
-| # | Hypothesis | How to verify | Fix |
-|---|-----------|--------------|-----|
-| 1 | `send_command_enter` appends `\r\n` but PTY expects `\r` only | Log the raw bytes written; check if `\n` after `\r` causes a second blank line | Change to write `\r` only |
-| 2 | `send_command_enter` writes two separate PTY calls (`data` then `\r`) with a gap between them | Check Rust impl — are there two `writer.write_all` calls? | Concatenate and write once: `format!("{}\r", data)` |
-| 3 | Command is sent before the shell prompt is ready (PTY spawned but bash not yet at prompt) | Increase sleep to 10s and test | Increase `tokio::time::sleep` duration |
-| 4 | The command string contains a stray `"` that breaks the shell parsing | Print the exact string before writing | Escape inner quotes |
+**`send_command_enter` contract (for gate commands — resume/cancel):**
 
-**Required `send_command_enter` implementation:**
+Gate commands (MilestoneGate, HITLGate) are short slash commands (`/gulf-loop:resume`, `/gulf-loop:cancel`). These are not affected by the paste-split issue (they are short enough for the ink event loop to handle atomically). For these, `send_command_enter` may continue to write `"{data}\r"` as a single `write_all`:
 
 ```rust
-// src-tauri/src/lib.rs or process/mod.rs
 async fn send_command_enter_inner(project_id: &str, data: &str) -> Result<(), String> {
     let mut sessions = SESSIONS.lock().map_err(|e| e.to_string())?;
     let session = sessions.get_mut(project_id)
         .ok_or_else(|| format!("No session for {}", project_id))?;
 
-    // Single write: data + carriage return only (no \n)
+    // Short commands: single write is safe (no paste-split needed)
     let payload = format!("{}\r", data);
     session.writer.write_all(payload.as_bytes())
         .map_err(|e| e.to_string())?;
@@ -1491,10 +1572,10 @@ async fn send_command_enter_inner(project_id: &str, data: &str) -> Result<(), St
 }
 ```
 
-**Contract:**
-- `send_command_enter` writes `"{data}\r"` as a **single** `write_all` call.
-- No `\n` appended — PTY line discipline converts `\r` to the newline the shell expects.
-- No delay between data and `\r`.
+**Rule summary:**
+- `spawn_and_send` (long prompt): 2-phase send — text first, `\r` after 500ms
+- `send_command_enter` (short slash commands): single `write_all("{data}\r")` — `\r` only, no `\n`
+- Never use `\r\n` — PTY line discipline handles line ending from `\r` alone
 
 ---
 
@@ -1859,9 +1940,9 @@ All files that must be created or modified:
 | `src/components/monitor/TokenUsageCard.tsx` | Modify | Add 30s interval for live re-render (§7.12.3); null guards per §7.12.5 |
 | `src/components/monitor/LoopMonitor.tsx` | Modify | SessionReport stats row: add Elapsed + Est. cost cards (§7.12.6) |
 | `src-tauri/src/watcher/mod.rs` | Verify | Confirm `JUDGE_EVOLUTION.md` → `judge-evolution-changed` is implemented |
-| `src-tauri/src/process/mod.rs` | Modify | `detect_question_block`, `QuestionBlock` struct, emit `claude-question-prompt` |
+| `src-tauri/src/process/mod.rs` | Modify | `detect_question_block`, `QuestionBlock` struct, emit `claude-question-prompt`; `ready: Arc<AtomicBool>` in `ClaudeProcess`; `is_claude_prompt()`, `strip_ansi()`, `is_session_ready()` (§7.11.1) |
 | `src/lib/rubric-generator.ts` | Modify | Flatten multi-line prompt (§7.10); defaults `maxIterations=50`, `milestoneEvery=0` |
-| `src-tauri/src/lib.rs` | Modify | Add `spawn_and_send` command (§7.11.1) |
+| `src-tauri/src/lib.rs` | Modify | `spawn_and_send`: streaming-ready wait + 2-phase send (§7.11.1) |
 | `src/components/projects/QuickRestartView.tsx` | Modify | `setActiveProject` before `start_watcher` (§7.11.4); `invoke('spawn_and_send', ...)` (§7.11.1); flatten prompt |
 | `src/components/wizard/GoalWizard.tsx` | Modify | `setActiveProject` before `start_watcher` (§7.11.4); `invoke('spawn_and_send', ...)` (§7.11.1); flatten prompt |
 | `src-tauri/src/process/mod.rs` | Modify | `send_command_enter`: single `write_all("{data}\r")`, no `\n` (§7.11.5) |
@@ -2094,6 +2175,23 @@ Every item must pass before the feature is considered complete.
 
 [ ] G14. After sending the gulf-loop command, Claude executes it (LoopMonitor transitions
          from StartingScreen to running view within ~10s of spawn_and_send resolving)
+
+[ ] G15. ClaudeProcess struct has a `ready: Arc<AtomicBool>` field; it is reset to false
+         when spawn_claude_inner creates a new session
+
+[ ] G16. PTY reader thread calls is_claude_prompt() on each output chunk;
+         when "> " or "❯ " is detected, ready is set to true via AtomicBool::store
+
+[ ] G17. spawn_and_send does NOT enter Phase 1 until either:
+         (a) ready=true AND elapsed >= 3s, followed by 300ms buffer, OR
+         (b) elapsed >= 15s (hard timeout)
+         — verify by artificially delaying Claude init and confirming command still executes
+
+[ ] G18. Rust PTY write sequence in spawn_and_send:
+         (1) write_all(command.as_bytes()) — no \r
+         (2) tokio::time::sleep(500ms)
+         (3) write_all(b"\r") — Enter only
+         Verify: log raw bytes written; confirm \r is a separate write from command text
 ```
 
 ### Usage Tracking (§7.12)
@@ -2141,6 +2239,10 @@ Every item must pass before the feature is considered complete.
 ---
 
 ## 11. Future Work
+
+### Blocked / Needs Clarification
+
+0. **Episodic memory watcher** — The current watcher covers 5 files. If gulf-loop writes additional memory files (e.g., `.claude/memory/*.md` wiki, episodic session logs), the watcher and `MemoryBrowser` need to be extended. **Requires**: confirmation of the exact file paths and format used by gulf-loop's structured memory feature (`structured_memory: true`). Once confirmed, add a 6th watch target to `start_watcher` and a new `memory-changed` event handler.
 
 ### High Priority
 
