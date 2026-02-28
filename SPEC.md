@@ -1,0 +1,1884 @@
+# Readable Ralph — Feature Specification
+
+> **Product goal**: A rich viewer for gulf-loop execution logs and artifacts.
+> Non-technical users must be able to trace, per-iteration, exactly what the AI did.
+
+**Stack**: Tauri 2 · React 18 · TypeScript · Zustand · Rust (`portable_pty`, `notify`)
+**Design system**: Dark glassmorphism, sharp corners (`--radius: 0px`), accent green `#10d9a0`
+**Source of truth for implementation**: `/non-dev-readable-ralph/src` and `src-tauri`
+
+---
+
+## Table of Contents
+
+1. [Existing Architecture Reference](#1-existing-architecture-reference)
+2. [File Watch & Event Contracts](#2-file-watch--event-contracts)
+3. [Data Schemas & Parser Contracts](#3-data-schemas--parser-contracts)
+4. [Type Definitions (Authoritative)](#4-type-definitions-authoritative)
+5. [Store Shape](#5-store-shape)
+6. [State Machine](#6-state-machine)
+7. [Feature Specifications](#7-feature-specifications)
+8. [UI / Layout Specifications](#8-ui--layout-specifications)
+9. [File Scope](#9-file-scope)
+10. [Acceptance Criteria (Binary Pass/Fail)](#10-acceptance-criteria-binary-passfail)
+11. [Future Work](#11-future-work)
+
+---
+
+## 1. Existing Architecture Reference
+
+### 1.1 Frontend Routing (App.tsx)
+
+```typescript
+const loopIsActive = loopState !== null && loopState.phase !== 'idle'
+const projectIsStarting = activeProject?.status === 'running' && loopState === null
+
+return showWizard       ? <GoalWizard />
+     : loopIsActive     ? <LoopMonitor />
+     : projectIsStarting? <StartingScreen />
+     : activeProject    ? <QuickRestartView />
+     : <EmptyState />
+```
+
+### 1.2 Tauri Command Reference (all existing commands)
+
+| Command | Signature | Notes |
+|---------|-----------|-------|
+| `check_claude_version` | `() -> String` | |
+| `check_gulf_loop_installed` | `() -> bool` | |
+| `list_projects` | `() -> Vec<Project>` | |
+| `create_project` | `(name, path, projectType) -> Result<Project>` | |
+| `delete_project` | `(id) -> Result<()>` | |
+| `update_project_status` | `(id, status) -> Result<()>` | |
+| `detect_project_type` | `(path) -> String` | `webapp\|cli\|script\|other` |
+| `get_settings` | `() -> RalphSettings` | |
+| `save_settings` | `(settings) -> Result<()>` | |
+| `spawn_claude` | `(app, projectId, projectPath, cols, rows) -> Result<()>` | |
+| `send_command` | `(projectId, data) -> Result<()>` | raw PTY write |
+| `send_command_enter` | `(projectId, data) -> Result<()>` | write + `\r\n` |
+| `kill_claude` | `(projectId) -> Result<()>` | |
+| `kill_all_sessions` | `() -> Result<()>` | |
+| `force_reset_session` | `(projectId, projectPath) -> Result<()>` | kills PTY + deletes state file |
+| `resize_session` | `(projectId, cols, rows) -> Result<()>` | |
+| `is_session_active` | `(projectId) -> bool` | |
+| `start_watcher` | `(app, projectPath) -> Result<()>` | |
+| `stop_watcher` | `() -> Result<()>` | |
+| `get_git_log` | `(projectPath, limit) -> Vec<GitCommit>` | |
+| `get_git_diff` | `(projectPath, commitHash) -> String` | truncated to 8000 chars |
+| `save_session` | `(projectPath, sessionJson) -> Result<()>` | writes `.ralph/session.json` |
+| `load_session` | `(projectPath) -> Option<String>` | |
+| `archive_session` | `(projectPath) -> Result<()>` | moves to `.ralph/sessions/{ts}.json` |
+| `list_sessions` | `(projectPath) -> Vec<String>` | newest first |
+| `write_file` | `(path, content) -> Result<()>` | |
+| `read_file` | `(path) -> Result<String>` | |
+| `file_exists` | `(path) -> bool` | |
+
+### 1.3 CSS Variables (Design System)
+
+```css
+/* Backgrounds */
+--bg-base: #0a0a0a;       --bg-0: #111111;
+--bg-1: #161616;          --bg-2: #1a1a1a;
+--bg-3: #202020;          --bg-hover: rgba(255,255,255,0.06);
+
+/* Glass */
+--glass-bg: rgba(12,12,20,0.70);
+--glass-border: rgba(255,255,255,0.07);
+--glass-blur: blur(22px) saturate(160%);
+--glass-shadow: 0 8px 32px rgba(0,0,0,0.55), 0 2px 8px rgba(0,0,0,0.35);
+
+/* Borders */
+--border: rgba(255,255,255,0.08);
+--border-mid: rgba(255,255,255,0.13);
+
+/* Text */
+--text-0: #eeeef5;    --text-1: #a8a8c0;
+--text-2: #686880;    --text-3: #3a3a52;
+
+/* Accent */
+--accent: #10d9a0;    --accent-dim: #059669;
+--accent-glow: rgba(16,217,160,0.13);
+--accent-glow-strong: rgba(16,217,160,0.26);
+
+/* Status */
+--green: #4ade80;     --red: #f87171;
+--yellow: #fbbf24;    --cyan: #22d3ee;
+
+/* Typography */
+--font-mono: 'JetBrains Mono', 'Fira Code', monospace;
+--font-sans: -apple-system, 'SF Pro Display', system-ui, sans-serif;
+
+/* Shape (all sharp) */
+--radius: 0px;    --radius-lg: 0px;    --radius-xl: 0px;
+
+/* Layout */
+--sidebar-width: 240px;     --right-panel-width: 280px;
+--titlebar-height: 36px;    --statusbar-height: 28px;
+
+/* Animation */
+--t-fast: 0.12s ease;    --t-mid: 0.2s ease;
+--t-slow: 0.35s cubic-bezier(0.4,0,0.2,1);
+```
+
+---
+
+## 2. File Watch & Event Contracts
+
+`start_watcher(app, projectPath)` monitors 5 files. On start, it **immediately emits the current state** of all existing files.
+
+| File | Event Name | Payload Type |
+|------|-----------|--------------|
+| `.claude/gulf-loop.local.md` | `loop-state-changed` | `{ content: string \| null, deleted: boolean }` |
+| `progress.txt` | `progress-changed` | `{ content: string \| null }` |
+| `JUDGE_FEEDBACK.md` | `judge-feedback-changed` | `{ content: string \| null }` |
+| `JUDGE_EVOLUTION.md` | `judge-evolution-changed` | `{ content: string \| null, deleted: boolean }` |
+| `RUBRIC.md` | `rubric-changed` | `{ content: string \| null, deleted: boolean }` |
+
+**Watcher contracts:**
+- File changes are debounced with **100ms delay** before reading, to avoid partial-write reads.
+- `deleted: true` means the file no longer exists.
+- `content: null` means the file was deleted or could not be read.
+- Receiving `content: null` must set the corresponding store field to `null`, not be silently ignored.
+- The frontend must handle all 5 events even when the file content is invalid; the app must never crash on malformed input.
+
+**PTY Events (from `process/mod.rs`):**
+
+| Event | Payload | Trigger |
+|-------|---------|---------|
+| `claude-output` | `{ project_id: string, data: string }` | Per chunk of PTY stdout |
+| `claude-auth-required` | `{}` | Auth prompt detected in PTY output |
+| `claude-session-dead` | `{ project_id: string }` | PTY reader thread exits |
+
+---
+
+## 3. Data Schemas & Parser Contracts
+
+### 3.1 `.claude/gulf-loop.local.md`
+
+**Location:** `{project_root}/.claude/gulf-loop.local.md`
+
+**File structure:**
+```
+---
+[YAML frontmatter]
+---
+[Original prompt body — everything after second ---]
+```
+
+**YAML field schema:**
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `active` | `boolean` | `false` | `true` = loop is running |
+| `iteration` | `number` | `1` | Current iteration (1-based) |
+| `max_iterations` | `number` | `50` | Maximum iterations allowed |
+| `completion_promise` | `string` | `"COMPLETE"` | Tag that signals completion |
+| `judge_enabled` | `boolean` | `false` | Judge mode on/off |
+| `consecutive_rejections` | `number` | `0` | Consecutive rejection count |
+| `hitl_threshold` | `number` | `5` | Rejections before HITL pause |
+| `autonomous` | `boolean` | `false` | Autonomous branch mode |
+| `branch` | `string` | `""` | Feature branch name |
+| `base_branch` | `string` | `"main"` | Merge target branch |
+| `milestone_every` | `number` | `0` | `0` = disabled; N = pause every N rounds |
+| `worktree_path` | `string` | `""` | Parallel mode worktree path |
+| `structured_memory` | `boolean` | `false` | Use `.claude/memory/` wiki |
+| `force_max` | `boolean` | `false` | Ignore completion signal |
+| `pause_reason` | `string` | `""` | `"milestone"` \| `"hitl"` \| `""` |
+
+**Parser contract (`state-parser.ts` → `parseLoopState`):**
+
+```typescript
+function parseLoopState(content: string | null | undefined): LoopState | null
+```
+
+- Returns `null` if `content` is null, undefined, or empty.
+- Returns `null` if YAML frontmatter cannot be parsed (malformed `---` block).
+- All missing YAML fields → schema defaults above.
+- `iteration` non-numeric → fallback `1`.
+- `max_iterations` ≤ 0 → fallback `50`.
+- Original prompt: everything after the closing `---`, trimmed. If no body exists, `originalPrompt: null`.
+- **Phase derivation logic:**
+
+  ```
+  active = true  AND  pause_reason = ''       → phase = 'running'
+  active = true  AND  pause_reason ≠ ''       → phase = 'paused'
+  active = false AND  pause_reason = 'hitl'   → phase = 'paused'
+  active = false AND  pause_reason = 'milestone' → phase = 'paused'
+  active = false AND  pause_reason = ''       → phase = 'completed'
+  ```
+
+- `loopMode` field: `autonomous: true` → `'autonomous'`; `judge_enabled: true` → `'judge'`; else `'basic'`.
+
+---
+
+### 3.2 `progress.txt`
+
+**Location:** `{project_root}/progress.txt` — **NOT** inside `.claude/`.
+
+**Standard format (all iterations):**
+
+```
+ORIGINAL_GOAL: [original user goal — written in iteration 1, never changes]
+ITERATION: [N]
+
+COMPLETED:
+- [completed task description]
+
+DECISIONS:
+- chose: [X], rejected: [Y], reason: [reason], revisit_if: [condition]
+
+UNCERTAINTIES:
+- [uncertain item]
+
+REMAINING_GAP:
+- [remaining work item]
+
+CONFIDENCE: [30-100]
+
+NEXT_STEP: [next planned action]
+```
+
+**Iteration 1 additional fields:**
+
+```
+STRENGTHS:
+- [strength to preserve]
+
+RISKS:
+- [major risk]
+
+GAPS:
+- [unknown item]
+
+APPROACHES_CONSIDERED:
+- [approach A]: [rejection reason]
+
+APPROACH:
+[chosen approach description — minimum 50 characters]
+```
+
+**Parser contract (`progress-parser.ts` → `parseProgress`):**
+
+```typescript
+function parseProgress(content: string | null | undefined): ProgressData | null
+```
+
+- Returns `null` if `content` is null, undefined, or empty string.
+- Returns a `ProgressData` with all defaults if content is non-empty but no sections match. Never throws.
+- Section headers are **case-sensitive** (`COMPLETED:`, not `completed:`).
+- Items under each section start with `- ` (dash + space). Lines not starting with `- ` are ignored.
+
+| Field | Extraction Rule | Default |
+|-------|----------------|---------|
+| `originalGoal` | Text on same line as `ORIGINAL_GOAL:` | `null` |
+| `iterationNumber` | Integer after `ITERATION:` | `null` |
+| `completed` | Array of `- ` items under `COMPLETED:` | `[]` |
+| `decisions` | Array parsed from `DECISIONS:` section | `[]` |
+| `uncertainties` | Array of `- ` items under `UNCERTAINTIES:` | `[]` |
+| `remainingGap` | Array of `- ` items under `REMAINING_GAP:` | `[]` |
+| `confidence` | Integer after `CONFIDENCE:`, clamped 30–100 | `null` |
+| `nextStep` | Text on same line as `NEXT_STEP:` | `null` |
+
+**`DECISIONS` line parsing:**
+
+```typescript
+const decisionRegex =
+  /chose:\s*([^,]+)(?:,\s*rejected:\s*([^,]+))?(?:,\s*reason:\s*([^,]+))?(?:,\s*revisit_if:\s*(.+))?/i;
+```
+
+- Line without `chose:` → skip.
+- `rejected`, `reason`, `revisit_if` are optional → `null` if absent.
+- Trailing whitespace trimmed from all extracted values.
+
+**Edge cases:**
+- `CONFIDENCE: abc` → `confidence: null`
+- `CONFIDENCE: 150` → `confidence: 100` (clamp)
+- `CONFIDENCE: 10` → `confidence: 30` (clamp)
+- Duplicate section headers → first occurrence wins.
+- `- ` items before the first section header → ignored.
+
+---
+
+### 3.3 `JUDGE_FEEDBACK.md`
+
+**Format:**
+
+```markdown
+---
+## Iteration 7 — REJECTED (3 consecutive) — 2026-02-27 14:32:01
+
+[Summary line — first non-empty line after header]
+
+[Additional context]
+---
+```
+
+**Parser contract (`parseJudgeFeedback`):**
+
+```typescript
+function parseJudgeFeedback(content: string | null | undefined): JudgeFeedbackEntry[]
+```
+
+- Returns `[]` if content is null/undefined/empty.
+- Blocks separated by `---` delimiters.
+- A file without `---` delimiters is treated as a single block.
+
+| Field | Extraction Rule | Fallback |
+|-------|----------------|---------|
+| `id` | `"feedback-${index}"` (0-indexed) | required |
+| `iteration` | `/Iteration\s+(\d+)/i` → parseInt | `null` |
+| `approved` | header contains `APPROVED` (case-insensitive) | `false` |
+| `consecutive` | `/\((\d+)\s+consecutive\)/i` → parseInt | `0` |
+| `timestamp` | last `—`-separated segment in `## ` header line | `""` |
+| `summary` | first non-empty line after the `## ` header | `""` |
+| `rawText` | full block text | required |
+| `rejectionType` | `"autocheck"` if block contains `FAILED:` section; `"judge"` otherwise | `null` if approved |
+| `autochecksPassed` | lines starting with `✓` | `[]` |
+| `autochecksFailed` | lines starting with `✗` | `[]` |
+
+---
+
+### 3.4 `JUDGE_EVOLUTION.md`
+
+**Format (one entry per line):**
+
+```
+[iter 3] REJECTED — silent catch blocks contain errors that should propagate
+[iter 5] APPROVED — all async handlers use consistent error structure
+```
+
+**Parser (inline, no separate function needed):**
+
+```typescript
+const lineRegex = /^\[iter\s+(\d+)\]\s+(APPROVED|REJECTED)\s*—\s*(.+)$/i;
+```
+
+- Lines not matching the regex → silently skipped.
+- Parsed fields: `iteration: number`, `approved: boolean`, `principle: string`.
+- Display order: newest (highest `iteration`) first.
+
+---
+
+## 4. Type Definitions (Authoritative)
+
+These types are the canonical source of truth. All new code must conform to them.
+
+```typescript
+// src/types/loop.ts
+
+export type LoopPhase = 'idle' | 'running' | 'paused' | 'completed' | 'cancelled';
+export type LoopMode = 'basic' | 'judge' | 'autonomous' | 'parallel';
+export type ActivityEventType =
+  | 'loop-started'
+  | 'iteration-complete'
+  | 'iteration-failed'
+  | 'loop-paused-hitl'
+  | 'loop-paused-milestone'
+  | 'loop-resumed'
+  | 'loop-completed'
+  | 'loop-cancelled'
+  | 'progress-updated';
+
+export interface LoopState {
+  active: boolean;
+  phase: LoopPhase;
+  iteration: number;
+  maxIterations: number;
+  completionPromise: string;
+  judgeEnabled: boolean;
+  consecutiveRejections: number;
+  hitlThreshold: number;
+  loopMode: LoopMode;
+  autonomous: boolean;
+  branch: string | null;
+  baseBranch: string | null;
+  milestoneEvery: number;
+  worktreePath: string;
+  structuredMemory: boolean;
+  forceMax: boolean;
+  pauseReason: 'milestone' | 'hitl' | '';
+  startedAt: string | null;
+  originalPrompt: string | null;
+}
+
+export interface DecisionItem {
+  chose: string;
+  rejected: string | null;
+  reason: string | null;
+  revisitIf: string | null;
+}
+
+export interface ProgressData {
+  completed: string[];
+  remainingGap: string[];
+  confidence: number | null;   // null = not parseable; always 30–100 when present
+  decisions: DecisionItem[];
+  uncertainties: string[];
+  nextStep: string | null;
+  originalGoal: string | null;
+  iterationNumber: number | null;
+}
+
+export interface ProgressSnapshot {
+  iteration: number;
+  completed: string[];
+  decisions: DecisionItem[];
+  uncertainties: string[];
+  remainingGap: string[];
+  confidence: number | null;
+  nextStep: string | null;
+}
+
+export interface GitCommit {
+  hash: string;
+  shortHash: string;
+  message: string;
+  authorEmail: string;
+  timestamp: string;
+  filesChanged: string[];
+  stats: string;
+}
+
+export interface JudgeFeedbackEntry {
+  id: string;
+  iteration: number | null;
+  approved: boolean;
+  consecutive: number;
+  timestamp: string;
+  summary: string;
+  rawText: string;
+  rejectionType: 'autocheck' | 'judge' | null;
+  autochecksPassed: string[];
+  autochecksFailed: string[];
+}
+
+export interface IterationItem {
+  iteration: number;
+  status: 'completed' | 'active' | 'pending' | 'failed';
+  label: string;              // "Round N"
+  sublabel?: string;          // progress.nextStep value
+  progressSnapshot?: ProgressSnapshot;
+  gitCommits?: GitCommit[];
+}
+
+export interface ActivityEvent {
+  id: string;
+  type: ActivityEventType;
+  iteration: number;
+  timestamp: number;          // Date.now()
+  label: string;              // Human-readable description
+  detail?: string;            // Optional secondary description
+}
+```
+
+```typescript
+// src/types/project.ts (existing — no changes required)
+
+export type ProjectStatus = 'idle' | 'running' | 'paused' | 'completed' | 'cancelled';
+export type ProjectType = 'webapp' | 'cli' | 'api' | 'script' | 'desktop' | 'other';
+
+export interface RalphProject {
+  id: string;
+  name: string;
+  path: string;
+  projectType: ProjectType;
+  status: ProjectStatus;
+  createdAt: string;
+  lastActiveAt: string;
+  totalIterations: number;
+  totalTimeMs: number;
+  estimatedCostKrw: number;
+}
+
+export interface RalphSettings {
+  theme: string;
+  locale: 'ko' | 'en';
+  advancedMode: boolean;
+}
+```
+
+---
+
+## 5. Store Shape
+
+### 5.1 LoopSlice (additions to existing slice)
+
+New fields added to existing `LoopSlice`:
+
+```typescript
+// NEW fields to add to loopSlice.ts
+interface LoopSliceAdditions {
+  rawProgressContent: string | null;       // Raw text of progress.txt (for dev mode viewer)
+  activityEvents: ActivityEvent[];         // Chronological event log
+  addActivityEvent: (event: ActivityEvent) => void;
+  // setProgress signature change:
+  setProgress: (progress: ProgressData | null, raw: string | null) => void;  // was setProgress(ProgressData | null)
+}
+```
+
+Full loop slice shape after additions:
+
+```typescript
+interface LoopSlice {
+  // Existing
+  loopState: LoopState | null;
+  progress: ProgressData | null;
+  judgeFeedback: JudgeFeedbackEntry[];
+  iterations: IterationItem[];
+  loopStartTimeMs: number | null;
+  rubricsContent: string | null;
+  judgeEvolution: string | null;
+
+  // New
+  rawProgressContent: string | null;
+  activityEvents: ActivityEvent[];
+
+  // Existing actions
+  setLoopState: (state: LoopState | null) => void;
+  setJudgeFeedback: (entries: JudgeFeedbackEntry[]) => void;
+  addJudgeFeedback: (entry: JudgeFeedbackEntry) => void;
+  updateIteration: (item: IterationItem) => void;
+  setIterations: (items: IterationItem[]) => void;
+  setLoopStartTime: (ms: number | null) => void;
+  resetLoop: () => void;
+  setRubricsContent: (content: string | null) => void;
+  setJudgeEvolution: (content: string | null) => void;
+  setIterationGitCommits: (iteration: number, commits: GitCommit[]) => void;
+
+  // Updated action (signature change)
+  setProgress: (progress: ProgressData | null, raw: string | null) => void;
+
+  // New action
+  addActivityEvent: (event: ActivityEvent) => void;
+}
+```
+
+### 5.2 SettingsSlice (existing — no changes)
+
+```typescript
+interface SettingsSlice {
+  locale: 'ko' | 'en';
+  theme: string;
+  advancedMode: boolean;
+  onboardingDone: boolean;
+  showTerminal: boolean;
+  showRightPanel: boolean;
+  authRequired: boolean;
+  rightTab: 'activity' | 'memory' | 'settings' | null;
+
+  setLocale, setTheme, setAdvancedMode, setOnboardingDone,
+  setShowTerminal, setShowRightPanel, setAuthRequired, setRightTab
+}
+```
+
+### 5.3 ActivityEvent Generation Rules
+
+These events must be generated **inside `setLoopState`** when the state transitions:
+
+| Condition | Event type |
+|-----------|-----------|
+| `prev === null` AND `next.phase === 'running'` | `loop-started` |
+| `prev` exists AND `next.iteration > prev.iteration` | `iteration-complete` |
+| `prev.phase !== 'paused'` AND `next.phase === 'paused'` AND `next.pauseReason === 'hitl'` | `loop-paused-hitl` |
+| `prev.phase !== 'paused'` AND `next.phase === 'paused'` AND `next.pauseReason === 'milestone'` | `loop-paused-milestone` |
+| `prev.phase === 'paused'` AND `next.phase === 'running'` | `loop-resumed` |
+| `prev.phase !== 'completed'` AND `next.phase === 'completed'` | `loop-completed` |
+| `prev.phase !== 'cancelled'` AND `next.phase === 'cancelled'` | `loop-cancelled` |
+
+`progress-updated` event is generated **inside `setProgress`** when new progress data is received.
+
+`iteration-failed` event is generated **inside `setJudgeFeedback`** when a new entry with `approved: false` is added for an iteration that was not previously marked failed.
+
+**Event `label` strings:**
+
+```typescript
+const ActivityLabels: Record<ActivityEventType, (e: ActivityEvent) => string> = {
+  'loop-started':            (e) => `Loop started — Round ${e.iteration}`,
+  'iteration-complete':      (e) => `Round ${e.iteration} complete`,
+  'iteration-failed':        (e) => `Round ${e.iteration} rejected by Judge`,
+  'loop-paused-hitl':        (e) => `Loop paused — awaiting review`,
+  'loop-paused-milestone':   (e) => `Milestone checkpoint reached`,
+  'loop-resumed':            (e) => `Loop resumed — Round ${e.iteration}`,
+  'loop-completed':          (e) => `Loop completed after ${e.iteration} rounds`,
+  'loop-cancelled':          (e) => `Loop cancelled at Round ${e.iteration}`,
+  'progress-updated':        (e) => `Progress updated`,
+};
+```
+
+---
+
+## 6. State Machine
+
+### 6.1 LoopPhase Transitions
+
+```
+null  (app start / no project selected)
+  │
+  ├─[project selected, no gulf-loop.local.md]──────────────────→ 'idle'
+  │
+  └─[project selected, file exists]
+         │
+         ├─ active=true  ───────────────────────────────────────→ 'running'
+         │     │
+         │     ├─[active=false, pause_reason='hitl']────────────→ 'paused'
+         │     ├─[active=false, pause_reason='milestone']────────→ 'paused'
+         │     │     └─[active=true again]────────────────────────→ 'running'
+         │     │
+         │     └─[active=false, pause_reason='']────────────────→ 'completed'
+         │
+         └─[file deleted (deleted=true)]──────────────────────────→ 'completed'
+              (loop ended without explicit pause_reason)
+```
+
+**Invariants:**
+- `'completed'` and `'cancelled'` are **terminal states**. Once entered, no further `loop-state-changed` events change the phase. Only `resetLoop()` can exit.
+- `loopState = null` means no file has been seen yet for the active project. `LoopMonitor` must NOT render in this state.
+- Phase never goes `'completed'` → `'running'` without `resetLoop()` first.
+
+### 6.2 IterationItem Status Derivation
+
+```typescript
+function deriveIterationStatus(
+  node: IterationItem,
+  loopState: LoopState,
+  feedback: JudgeFeedbackEntry[]
+): IterationItem['status'] {
+  const isRejected = feedback.some(
+    f => f.iteration === node.iteration && !f.approved
+  );
+  const isApproved = feedback.some(
+    f => f.iteration === node.iteration && f.approved
+  );
+
+  // Final approval overrides rejection
+  if (isRejected && !isApproved) return 'failed';
+
+  if (loopState.iteration > node.iteration) return 'completed';
+  if (loopState.iteration === node.iteration) return 'active';
+  return 'pending';
+}
+```
+
+### 6.3 ProgressSnapshot Capture
+
+When iteration increments (`next.iteration > prev.iteration`), capture the current progress as a snapshot and attach it to the **previous** iteration's `IterationItem`:
+
+```typescript
+// Inside setLoopState, when iteration increments:
+if (prev && next.iteration > prev.iteration) {
+  const snapshot: ProgressSnapshot = {
+    iteration: prev.iteration,
+    completed: get().progress?.completed ?? [],
+    decisions: get().progress?.decisions ?? [],
+    uncertainties: get().progress?.uncertainties ?? [],
+    remainingGap: get().progress?.remainingGap ?? [],
+    confidence: get().progress?.confidence ?? null,
+    nextStep: get().progress?.nextStep ?? null,
+  };
+  // attach snapshot to iteration prev.iteration
+  get().updateIteration({ iteration: prev.iteration, progressSnapshot: snapshot });
+}
+```
+
+---
+
+## 7. Feature Specifications
+
+### 7.1 ActivityFeed Component (NEW)
+
+**File:** `src/components/monitor/ActivityFeed.tsx`
+
+**Purpose:** Displays the full event stream of the loop in reverse-chronological order. Replaces the current JudgeFeedback-only "Activity" tab.
+
+**Rendering contract:**
+- Source: `activityEvents` from store.
+- Display order: **newest first** (`[...events].reverse()`).
+- Empty state: `"Start a loop to see activity."` — centered, `var(--text-2)` color.
+- Each event row:
+  - Left: colored dot (6×6px circle)
+  - Center: `label` (primary text) + optional `detail` (secondary, smaller)
+  - Right: relative timestamp (`formatRelativeTime(event.timestamp)`)
+
+**Dot colors by event type:**
+
+| Event type | Dot color |
+|-----------|-----------|
+| `iteration-complete` | `var(--green)` |
+| `iteration-failed` | `var(--red)` |
+| `loop-completed` | `var(--accent)` |
+| `loop-paused-hitl` | `var(--yellow)` |
+| `loop-paused-milestone` | `var(--yellow)` |
+| `loop-resumed` | `var(--cyan)` |
+| `loop-started` | `var(--accent)` |
+| `loop-cancelled` | `var(--red)` |
+| `progress-updated` | `var(--text-3)` |
+
+**`formatRelativeTime(ts: number): string`:**
+- `< 60s` → `"just now"`
+- `< 60min` → `"Nm ago"` (e.g. `"3m ago"`)
+- `< 24h` → `"Nh ago"`
+- else → locale date string
+
+**Full JSX:**
+
+```tsx
+export function ActivityFeed() {
+  const events = useStore((s) => s.activityEvents);
+
+  if (events.length === 0) {
+    return <div className="monitor-empty">Start a loop to see activity.</div>;
+  }
+
+  return (
+    <div className="activity-feed">
+      {[...events].reverse().map((event) => (
+        <div key={event.id} className={`activity-event activity-event--${event.type}`}>
+          <span className="activity-event-dot" />
+          <div className="activity-event-content">
+            <span className="activity-event-label">{event.label}</span>
+            {event.detail && (
+              <span className="activity-event-detail">{event.detail}</span>
+            )}
+          </div>
+          <span className="activity-event-time">
+            {formatRelativeTime(event.timestamp)}
+          </span>
+        </div>
+      ))}
+    </div>
+  );
+}
+```
+
+**CSS:**
+
+```css
+.activity-feed {
+  display: flex; flex-direction: column; gap: 1px; padding: 8px 4px;
+}
+.activity-event {
+  display: flex; align-items: flex-start; gap: 8px;
+  padding: 6px 8px; font-size: 12px;
+  transition: background var(--t-fast);
+}
+.activity-event:hover { background: var(--bg-hover); }
+.activity-event-dot {
+  width: 6px; height: 6px; border-radius: 50%;
+  margin-top: 4px; flex-shrink: 0; background: var(--text-3);
+}
+.activity-event--iteration-complete  .activity-event-dot { background: var(--green); }
+.activity-event--iteration-failed    .activity-event-dot { background: var(--red); }
+.activity-event--loop-completed      .activity-event-dot { background: var(--accent); }
+.activity-event--loop-started        .activity-event-dot { background: var(--accent); }
+.activity-event--loop-paused-hitl    .activity-event-dot { background: var(--yellow); }
+.activity-event--loop-paused-milestone .activity-event-dot { background: var(--yellow); }
+.activity-event--loop-resumed        .activity-event-dot { background: var(--cyan); }
+.activity-event--loop-cancelled      .activity-event-dot { background: var(--red); }
+.activity-event-content {
+  flex: 1; display: flex; flex-direction: column; gap: 1px;
+}
+.activity-event-label  { color: var(--text-1); line-height: 1.4; }
+.activity-event-detail { font-size: 11px; color: var(--text-2); }
+.activity-event-time   { font-size: 10px; color: var(--text-3); white-space: nowrap; margin-left: 4px; }
+```
+
+---
+
+### 7.2 IterationTimeline — Rich Snapshot Panel
+
+**File:** `src/components/monitor/IterationTimeline.tsx` (modify existing)
+
+**New behavior for the snapshot detail panel (right side of timeline):**
+
+When a round node is clicked:
+- `selectedIteration` state updates to the clicked iteration number.
+- If `progressSnapshot` exists → render the rich panel below.
+- If `progressSnapshot` is `undefined` → render: `<p className="monitor-empty">No snapshot for this round.</p>`
+
+**Snapshot panel contract:**
+
+```tsx
+{selectedSnapshot ? (
+  <div className="iteration-snapshot">
+    <div className="iteration-snapshot-header">
+      <span className="iteration-snapshot-title">Round {selectedIteration}</span>
+      {selectedSnapshot.confidence !== null && (
+        <span className="iteration-snapshot-confidence">
+          {selectedSnapshot.confidence}% confidence
+        </span>
+      )}
+    </div>
+
+    {selectedSnapshot.completed.length > 0 && (
+      <div className="snapshot-section">
+        <div className="snapshot-section-label">Completed</div>
+        {selectedSnapshot.completed.map((item, i) => (
+          <div key={i} className="snapshot-item">{item}</div>
+        ))}
+      </div>
+    )}
+
+    {selectedSnapshot.nextStep && (
+      <div className="snapshot-section">
+        <div className="snapshot-section-label">Next goal</div>
+        <div className="snapshot-item snapshot-item--accent">{selectedSnapshot.nextStep}</div>
+      </div>
+    )}
+
+    {selectedSnapshot.decisions.length > 0 && (
+      <div className="snapshot-section">
+        <div className="snapshot-section-label">Decisions</div>
+        {selectedSnapshot.decisions.map((d, i) => (
+          <div key={i} className="snapshot-item">
+            <strong>{d.chose}</strong>
+            {d.rejected && <span className="snapshot-rejected"> vs {d.rejected}</span>}
+            {d.reason && <span className="snapshot-reason"> — {d.reason}</span>}
+          </div>
+        ))}
+      </div>
+    )}
+
+    {selectedSnapshot.uncertainties.length > 0 && (
+      <div className="snapshot-section">
+        <div className="snapshot-section-label">Uncertainties</div>
+        {selectedSnapshot.uncertainties.map((item, i) => (
+          <div key={i} className="snapshot-item snapshot-item--muted">{item}</div>
+        ))}
+      </div>
+    )}
+  </div>
+) : (
+  <p className="monitor-empty">No snapshot for this round.</p>
+)}
+```
+
+**Node status visual spec:**
+
+| Status | Visual |
+|--------|--------|
+| `completed` | Default node style |
+| `active` | Accent-colored ring |
+| `pending` | Dimmed / `var(--text-3)` |
+| `failed` | `2px solid var(--red)` border + `rgba(248,113,113,0.1)` background |
+
+**Sublabel rule:**
+- `active` node: sublabel = `progress.nextStep` (from current progress, not snapshot)
+- `nextStep` is `null` → no sublabel rendered (empty string display forbidden)
+
+**CSS additions:**
+
+```css
+.iteration-snapshot-header {
+  display: flex; justify-content: space-between; align-items: center;
+  margin-bottom: 10px;
+}
+.iteration-snapshot-title   { font-size: 13px; font-weight: 600; color: var(--text-0); }
+.iteration-snapshot-confidence { font-size: 11px; color: var(--accent); font-weight: 600; }
+.snapshot-section           { margin-bottom: 8px; }
+.snapshot-section-label     {
+  font-size: 10px; font-weight: 700; color: var(--text-2);
+  letter-spacing: 0.06em; text-transform: uppercase; margin-bottom: 4px;
+}
+.snapshot-item              { font-size: 12px; color: var(--text-1); padding: 2px 0; }
+.snapshot-item--accent      { color: var(--accent); }
+.snapshot-item--muted       { color: var(--text-2); }
+.snapshot-rejected          { color: var(--red); font-size: 11px; }
+.snapshot-reason            { color: var(--text-2); font-style: italic; }
+
+.iteration-node--failed {
+  border: 2px solid var(--red) !important;
+  background: rgba(248, 113, 113, 0.1) !important;
+}
+.iteration-node--failed .iteration-node-number { color: var(--red); }
+```
+
+---
+
+### 7.3 ProgressSummary — Expand/Collapse
+
+**File:** `src/components/monitor/ProgressSummary.tsx` (modify existing)
+
+**Contract:**
+- If `progress === null`: return `null` (do not render the component).
+- `completed.length ≤ 3`: show all items directly.
+- `completed.length > 3`: show first 3 + expand button `"+N more"`.
+- Expand button click → show all + button changes to `"Show less"`.
+- `confidence === null`: do not render confidence display (no `0%` placeholder).
+
+```tsx
+const [showAll, setShowAll] = useState(false);
+const visible = showAll ? progress.completed : progress.completed.slice(0, 3);
+const extra = progress.completed.length - 3;
+
+{progress.completed.length > 3 && (
+  <button className="expand-btn" onClick={() => setShowAll(v => !v)}>
+    {showAll ? 'Show less' : `+${extra} more`}
+  </button>
+)}
+```
+
+```css
+.expand-btn {
+  font-size: 11px; color: var(--accent); background: none; border: none;
+  cursor: pointer; padding: 2px 0; transition: opacity var(--t-fast);
+}
+.expand-btn:hover { opacity: 0.7; }
+```
+
+---
+
+### 7.4 JudgeFeedback — Formatting Improvements
+
+**File:** `src/components/monitor/JudgeFeedback.tsx` (modify existing)
+
+**Contract:**
+- Empty state (`judgeFeedback.length === 0`): `"No judge feedback yet."` (centered).
+- Timestamp: format with `formatFeedbackTime`. ISO parse failure → show raw string.
+- Badge: show `approved` status + iteration number if `entry.iteration !== null`.
+- "View raw" toggle: shows `entry.rawText` in a `<pre>` block.
+
+```typescript
+function formatFeedbackTime(ts: string): string {
+  if (!ts) return '';
+  try {
+    const d = new Date(ts);
+    if (isNaN(d.getTime())) return ts;
+    return d.toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' });
+  } catch { return ts; }
+}
+```
+
+---
+
+### 7.5 SessionReport — Completed Loop View
+
+**File:** `src/components/monitor/LoopMonitor.tsx` (modify existing completed branch)
+
+**Trigger:** `loopState.phase === 'completed' || loopState.phase === 'cancelled'`
+
+**Layout (in order):**
+
+1. **GoalBanner** — `progress.originalGoal ?? "No goal recorded"` (never empty div)
+
+2. **Stats Row** — horizontal flex, equal-width cards:
+   - Always: `loopState.iteration` / `"Rounds"`, `progress.completed.length ?? 0` / `"Tasks done"`, `progress.confidence ?? '—'` / `"Confidence"`
+   - Judge mode only (`judgeEnabled: true`): `loopState.consecutiveRejections` / `"Rejections"`
+
+3. **Completed tasks** — full list, collapse/expand at 3. Left border `2px solid var(--green)`.
+
+4. **Remaining** — `progress.remainingGap` items. **Only render when `phase === 'cancelled'`**. Left border `2px solid var(--yellow)`.
+
+5. **Decisions** — `progress.decisions` full list.
+
+6. **Uncertainties** — `progress.uncertainties` full list.
+
+7. **Per-round log** — `iterations` array rendered as `IterationReportRow` components (expand/collapse each).
+
+8. **"New Goal" button** — calls `resetLoop()` + triggers `setShowWizard(true)`.
+
+**IterationReportRow contract:**
+- Default: collapsed (ChevronRight icon).
+- Expand: shows `progressSnapshot` fields + `gitCommits` list.
+- Git diff: on-demand via `invoke('get_git_diff', { projectPath, commitHash })`. Show loading state while fetching.
+- Diff text in `<pre>` with horizontal scroll.
+
+**Stats CSS:**
+
+```css
+.result-summary-row {
+  display: flex; gap: 16px; margin-bottom: 16px;
+  padding-bottom: 16px; border-bottom: 1px solid var(--border);
+}
+.result-stat          { text-align: center; flex: 1; }
+.result-stat-value    { font-size: 22px; font-weight: 700; color: var(--accent); font-family: var(--font-mono); }
+.result-stat-label    { font-size: 10px; color: var(--text-2); margin-top: 2px; letter-spacing: 0.04em; }
+```
+
+---
+
+### 7.6 Completed Project History View
+
+**File:** `src/components/projects/ProjectList.tsx` (modify `handleProjectClick`)
+
+**Contract:**
+
+When a project with `status === 'completed' || status === 'cancelled'` is clicked:
+
+1. Call `invoke('load_session', { projectPath: project.path })`.
+2. If session data exists:
+   a. Parse the JSON.
+   b. Call `setIterations(data.iterations ?? [])`.
+   c. Call `setProgress(data.progress ?? null, null)`.
+   d. Call `setJudgeFeedback(data.judgeFeedback ?? [])`.
+   e. Build a **synthetic `LoopState`** and call `setLoopState(syntheticState)`.
+3. If no session data: show `QuickRestartView` (start fresh).
+
+**Synthetic LoopState construction:**
+
+```typescript
+const maxIter = data.iterations?.length > 0
+  ? Math.max(...data.iterations.map((i: IterationItem) => i.iteration))
+  : 0;
+
+const syntheticState: LoopState = {
+  active: false,
+  phase: project.status as 'completed' | 'cancelled',
+  iteration: maxIter,
+  maxIterations: 50,
+  completionPromise: 'COMPLETE',
+  judgeEnabled: data.iterations?.some((i: IterationItem) =>
+    i.status === 'failed') ?? false,
+  consecutiveRejections: 0,
+  hitlThreshold: 5,
+  loopMode: 'basic',
+  autonomous: false,
+  branch: null,
+  baseBranch: null,
+  milestoneEvery: 0,
+  worktreePath: '',
+  structuredMemory: false,
+  forceMax: false,
+  pauseReason: '',
+  startedAt: null,
+  originalPrompt: data.progress?.originalGoal ?? null,
+};
+```
+
+---
+
+### 7.7 JudgeEvolution Display
+
+**File:** `src/components/memory/MemoryBrowser.tsx` (add `JudgeEvolutionLog` section at bottom)
+
+**Contract:**
+- Source: `judgeEvolution` from store.
+- If `judgeEvolution === null`: do not render section (no empty placeholder).
+- Parse lines with regex; skip malformed lines silently.
+- Display newest first.
+- `approved` entries: green dot `✓`.
+- `rejected` entries: red dot `✗`.
+
+**Watcher is already in place.** Ensure App.tsx listener calls `setJudgeEvolution`:
+
+```typescript
+listen<{ content: string | null }>('judge-evolution-changed', (event) => {
+  useStore.getState().setJudgeEvolution(event.payload.content ?? null);
+});
+```
+
+---
+
+### 7.8 AskUserQuestion GUI Overlay
+
+**Files:** `src/components/monitor/QuestionPromptOverlay.tsx` (NEW), `src-tauri/src/process/mod.rs` (modify)
+
+**Purpose:** Detect `AskUserQuestion` prompts in PTY output and render clickable choice buttons instead of requiring terminal interaction.
+
+**PTY pattern to detect:**
+
+```
+? [question text]
+  1. [choice 1]
+  2. [choice 2]
+  ...
+
+Your choice (1-N):
+```
+
+**Rust implementation (`process/mod.rs`):**
+
+```rust
+#[derive(Serialize, Clone)]
+struct QuestionBlock {
+    question: String,
+    choices: Vec<String>,   // stripped of "N. " prefix
+}
+
+fn detect_question_block(buffer: &str) -> Option<QuestionBlock> {
+    // 1. Find line starting with "? "
+    // 2. Collect "  N. ..." lines after it
+    // 3. Detect "Your choice" line → trigger emit
+    // Emit: app.emit("claude-question-prompt", &block)
+}
+```
+
+- Buffer per-project. Accumulate lines until "Your choice" is detected, then emit and clear buffer.
+- Maximum 10 choices parsed.
+
+**Store additions (`settingsSlice.ts`):**
+
+```typescript
+activeQuestion: { question: string; choices: string[] } | null;
+setActiveQuestion: (q: { question: string; choices: string[] } | null) => void;
+```
+
+**App.tsx listener:**
+
+```typescript
+listen<{ question: string; choices: string[] }>('claude-question-prompt', (event) => {
+  useStore.getState().setActiveQuestion(event.payload);
+});
+```
+
+**Component contract:**
+
+```tsx
+// src/components/monitor/QuestionPromptOverlay.tsx
+export function QuestionPromptOverlay() {
+  const activeQuestion = useStore((s) => s.activeQuestion);
+  if (!activeQuestion) return null;
+
+  const handleSelect = async (idx: number) => {
+    const projectId = useStore.getState().activeProjectId ?? '';
+    await invoke('send_command', { projectId, data: `${idx + 1}\r` });
+    setTimeout(() => useStore.getState().setActiveQuestion(null), 200);
+  };
+
+  return (
+    <div className="question-overlay">
+      <div className="question-box">
+        <div className="question-text">{activeQuestion.question}</div>
+        <div className="question-choices">
+          {activeQuestion.choices.slice(0, 10).map((choice, idx) => (
+            <button
+              key={idx}
+              className="question-choice-btn"
+              onClick={() => handleSelect(idx)}
+              type="button"
+            >
+              <span className="question-choice-num">{idx + 1}</span>
+              <span className="question-choice-text">{choice}</span>
+            </button>
+          ))}
+        </div>
+        <button
+          className="question-dismiss"
+          onClick={() => useStore.getState().setActiveQuestion(null)}
+          type="button"
+        >
+          Type manually
+        </button>
+      </div>
+    </div>
+  );
+}
+```
+
+**Render location:** Inside `LoopMonitor.tsx` as an absolute overlay (z-index: 200).
+
+**CSS:**
+
+```css
+.question-overlay {
+  position: fixed; inset: 0; background: rgba(0,0,0,0.6);
+  display: flex; align-items: center; justify-content: center;
+  z-index: 200; backdrop-filter: blur(4px);
+}
+.question-box {
+  background: var(--bg-1); border: 1px solid var(--border);
+  padding: 20px; max-width: 480px; width: 90%;
+  display: flex; flex-direction: column; gap: 12px;
+}
+.question-text { font-size: 14px; color: var(--text-0); font-weight: 600; line-height: 1.5; }
+.question-choices { display: flex; flex-direction: column; gap: 6px; }
+.question-choice-btn {
+  display: flex; align-items: center; gap: 10px; padding: 8px 12px;
+  background: var(--bg-2); border: 1px solid var(--border); cursor: pointer;
+  color: var(--text-1); font-size: 13px; text-align: left;
+  transition: border-color var(--t-fast), background var(--t-fast);
+}
+.question-choice-btn:hover { border-color: var(--accent); background: var(--accent-glow); }
+.question-choice-num {
+  min-width: 20px; height: 20px; background: var(--bg-3); color: var(--accent);
+  font-size: 11px; font-weight: 700; display: flex; align-items: center;
+  justify-content: center; font-family: var(--font-mono);
+}
+.question-dismiss {
+  font-size: 11px; color: var(--text-2); background: none; border: none;
+  cursor: pointer; align-self: flex-end; padding: 4px 8px;
+  transition: color var(--t-fast);
+}
+.question-dismiss:hover { color: var(--text-1); }
+```
+
+---
+
+### 7.9 Raw Log Viewer (Developer Mode)
+
+**File:** `src/components/layout/RightPanel.tsx` (add raw log tab when `advancedMode: true`)
+
+**Contract:**
+- Only rendered when `advancedMode === true`. Not in DOM otherwise.
+- `rawProgressContent === null` → show `"No data"` in that section (not a blank `<pre>`).
+- `loopState === null` → show `"No state"` for the loop state section.
+
+```tsx
+{advancedMode && rightTab === 'raw' && (
+  <div className="raw-log-view">
+    <div className="raw-log-section">
+      <div className="raw-log-title">gulf-loop state</div>
+      <pre className="raw-log-content">
+        {loopState ? JSON.stringify(loopState, null, 2) : 'No state'}
+      </pre>
+    </div>
+    <div className="raw-log-section">
+      <div className="raw-log-title">progress.txt</div>
+      <pre className="raw-log-content">{rawProgressContent ?? 'No data'}</pre>
+    </div>
+  </div>
+)}
+```
+
+**Add "raw" to TABS in RightPanel when `advancedMode: true`:**
+
+```typescript
+const TABS_BASE = [
+  { id: 'activity', icon: <Zap size={15} />,         label: 'Activity' },
+  { id: 'memory',   icon: <BrainCircuit size={15} />, label: 'Memory' },
+  { id: 'settings', icon: <Settings2 size={15} />,    label: 'Settings' },
+] as const;
+
+const TABS_DEV = [
+  ...TABS_BASE,
+  { id: 'raw', icon: <Code2 size={15} />, label: 'Raw' },
+] as const;
+
+const TABS = advancedMode ? TABS_DEV : TABS_BASE;
+```
+
+---
+
+### 7.10 Max Iterations Default & Anti-Early-Completion
+
+**File:** `src/lib/rubric-generator.ts` (modify `buildGulfLoopPrompt`)
+
+**Default values:**
+- `maxIterations`: `50` (was `30`)
+- `milestoneEvery`: `0` (disabled by default)
+
+**Required instructions appended to every gulf-loop prompt:**
+
+```
+---
+LOOP EXECUTION RULES (do not override):
+- Use ALL available iterations to build incrementally.
+- Do NOT output the completion signal in iteration 1 unless every requirement is demonstrably met and tested.
+- Each iteration must deliver a meaningful, atomic, runnable increment.
+- Update progress.txt at the end of EVERY iteration using the exact format specified.
+```
+
+**Bug fix — multi-line prompt must be flattened before PTY transmission:**
+
+`buildGulfLoopPrompt` produces a multi-line string with many `\n` characters. When this string is sent raw to the PTY, each `\n` is interpreted as Enter by the shell — only the first line is submitted as a command; the rest become separate inputs.
+
+**Rule:** before passing the prompt to `send_command_enter`, replace every `\r?\n` with a single space.
+
+```typescript
+// rubric-generator.ts (or call-site in QuickRestartView / GoalWizard)
+const singleLinePrompt = buildGulfLoopPrompt(goal, rubric)
+  .replace(/\r?\n/g, ' ')
+  .replace(/\s{2,}/g, ' ')   // collapse multiple spaces
+  .trim();
+
+await invoke('send_command_enter', { projectId, data: `/gulf-loop:start "${singleLinePrompt}"` });
+```
+
+**Contract:**
+- The final string sent to the PTY must contain **zero `\n` or `\r` characters**.
+- Escape any `"` characters inside the prompt before embedding in the shell command string.
+
+---
+
+### 7.11 PTY Command Timing & Gate Fixes
+
+#### 7.11.1 Command Timing — Wait for Actual Output (QuickRestartView, GoalWizard)
+
+**Problem:** A fixed 5-second sleep before sending the loop command is insufficient when Claude takes longer to start, and wasteful when it starts quickly.
+
+**Required behavior:**
+
+1. After `spawn_claude(...)`, subscribe to the `claude-output` event **for the current `projectId`**.
+2. On the **first** `claude-output` event received for this project, wait **2 000 ms**, then send the loop command via `send_command_enter`.
+3. If no `claude-output` is received within **12 000 ms** of spawning, send the command anyway (hard fallback).
+4. Unsubscribe from `claude-output` after the command is sent (one-shot listener).
+
+```typescript
+// Pseudocode for QuickRestartView / GoalWizard command dispatch
+async function startLoop(projectId: string, projectPath: string, prompt: string) {
+  await invoke('spawn_claude', { projectId, projectPath, cols: 220, rows: 50 });
+
+  let sent = false;
+
+  const sendCommand = async () => {
+    if (sent) return;
+    sent = true;
+    unlistenOutput?.();
+    clearTimeout(hardTimeout);
+    const cmd = buildFlatCommand(prompt);   // flattened single-line string
+    await invoke('send_command_enter', { projectId, data: cmd });
+  };
+
+  const unlistenOutput = await listen<{ project_id: string; data: string }>(
+    'claude-output',
+    (event) => {
+      if (event.payload.project_id !== projectId) return;
+      setTimeout(sendCommand, 2_000);   // 2s after first output
+    }
+  );
+
+  // Hard fallback: 12s after spawn
+  const hardTimeout = setTimeout(sendCommand, 12_000);
+}
+```
+
+**Invariants:**
+- `sendCommand` is idempotent — called at most once regardless of how many `claude-output` events arrive.
+- The hard timeout is always cleared if `sendCommand` fires from the output listener.
+- The output listener is always unsubscribed after `sendCommand` runs.
+
+---
+
+#### 7.11.2 MilestoneGate — Missing `projectId` Fix
+
+**Problem:** `invoke('send_command', { data: '...' })` omits `projectId`, causing the Tauri command to fail silently (writes to no PTY).
+
+**Required fix:** All PTY writes in `MilestoneGate.tsx` must use `send_command_enter` with explicit `projectId`.
+
+```typescript
+// MilestoneGate.tsx — every invoke call must follow this pattern:
+const projectId = useStore.getState().activeProjectId ?? '';
+
+// Resume loop
+await invoke('send_command_enter', { projectId, data: '/gulf-loop:resume' });
+
+// Cancel loop
+await invoke('send_command_enter', { projectId, data: '/gulf-loop:cancel' });
+```
+
+**Contract:**
+- `projectId` must be read from the store at call time (not captured at component mount time, to avoid stale closures).
+- Use `send_command_enter` (not `send_command`) for all gulf-loop slash commands so the shell receives a proper newline.
+
+---
+
+#### 7.11.3 HITLGate / MilestoneGate — Unified `send_command_enter`
+
+**Problem:** Resume and cancel calls are inconsistent across `HITLGate` and `MilestoneGate` — some use `send_command`, some use `send_command_enter`, some omit `projectId`.
+
+**Rule:** Every resume/cancel PTY write in both gates must use the same pattern:
+
+```typescript
+await invoke('send_command_enter', {
+  projectId: useStore.getState().activeProjectId ?? '',
+  data: '<slash-command>',
+});
+```
+
+**Exhaustive list of calls to fix:**
+
+| Component | Action | Correct call |
+|-----------|--------|-------------|
+| `MilestoneGate` | Resume | `invoke('send_command_enter', { projectId, data: '/gulf-loop:resume' })` |
+| `MilestoneGate` | Cancel | `invoke('send_command_enter', { projectId, data: '/gulf-loop:cancel' })` |
+| `HITLGate` | Resume | `invoke('send_command_enter', { projectId, data: '/gulf-loop:resume' })` |
+| `HITLGate` | Cancel | `invoke('send_command_enter', { projectId, data: '/gulf-loop:cancel' })` |
+
+No `send_command` (without `_enter`) should be used for slash commands. `send_command` is reserved for raw PTY data that does not need a trailing newline (e.g., keystroke injection in `QuestionPromptOverlay`).
+
+---
+
+## 8. UI / Layout Specifications
+
+### 8.1 Titlebar
+
+**File:** `src/components/layout/Titlebar.tsx`
+
+Replace all text buttons with Lucide icon buttons. No visible text labels.
+
+```tsx
+import { PanelRight, TerminalSquare } from 'lucide-react';
+
+// Replace text buttons:
+<button className="icon-btn titlebar-icon-btn" onClick={toggleRightPanel} title="Toggle panel">
+  <PanelRight size={14} strokeWidth={1.8} />
+</button>
+<button className="icon-btn titlebar-icon-btn" onClick={toggleTerminal} title="Toggle terminal">
+  <TerminalSquare size={14} strokeWidth={1.8} />
+</button>
+```
+
+```css
+.titlebar-icon-btn { width: 28px; height: 28px; -webkit-app-region: no-drag; }
+```
+
+**Test:** After change, `Titlebar` must contain zero visible text nodes in the button area.
+
+---
+
+### 8.2 Right Panel — Vertical Activity Bar
+
+**File:** `src/components/layout/RightPanel.tsx`
+
+**Replace** horizontal pill tabs with a vertical icon activity bar (left side of right panel).
+
+```tsx
+// src/components/layout/RightPanel.tsx
+
+type RightTabId = 'activity' | 'memory' | 'settings';
+
+const TABS: { id: RightTabId; icon: ReactNode; label: string }[] = [
+  { id: 'activity', icon: <Zap size={15} />,          label: 'Activity' },
+  { id: 'memory',   icon: <BrainCircuit size={15} />,  label: 'Memory' },
+  { id: 'settings', icon: <Settings2 size={15} />,     label: 'Settings' },
+];
+
+export function RightPanel() {
+  const { rightTab, setRightTab, showRightPanel, setShowRightPanel } = useStore();
+
+  const handleTabClick = (id: RightTabId) => {
+    if (rightTab === id && showRightPanel) {
+      setShowRightPanel(false);
+    } else {
+      setRightTab(id);
+      setShowRightPanel(true);
+    }
+  };
+
+  return (
+    <div className="right-panel-inner">
+      {/* Always-visible vertical bar */}
+      <div className="right-panel-activity-bar">
+        {TABS.map(({ id, icon, label }) => (
+          <button
+            key={id}
+            className={`activity-tab${rightTab === id && showRightPanel ? ' active' : ''}`}
+            onClick={() => handleTabClick(id)}
+            title={label}
+          >
+            {icon}
+          </button>
+        ))}
+      </div>
+
+      {/* Toggleable content panel */}
+      {showRightPanel && rightTab && (
+        <div className="right-panel-content">
+          <div className="right-panel-content-header">
+            <span className="right-panel-content-title">
+              {TABS.find(t => t.id === rightTab)?.label}
+            </span>
+            <button className="icon-btn" onClick={() => setShowRightPanel(false)}>
+              <X size={12} />
+            </button>
+          </div>
+          <div className="right-panel-scroll">
+            {rightTab === 'activity' && <ActivityFeed />}
+            {rightTab === 'memory'   && <MemoryBrowser />}
+            {rightTab === 'settings' && <ProjectSettings />}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+```
+
+**Layout measurements:**
+- Activity bar: `36px` wide, always visible, `border-right: 1px solid var(--border)`
+- Tab button: `28×28px`, centered icon
+- Active tab: `2px solid var(--accent)` left border + `var(--accent-glow)` background
+- Content panel: `280px` wide, appears to the left of activity bar
+
+**`AppShell.tsx` changes:**
+- Remove `rightPanel` prop conditional rendering.
+- Render `<RightPanel />` directly inside `.app-body` — activity bar is always present.
+
+---
+
+### 8.3 ProjectCard → Tree Row Pattern
+
+**File:** `src/components/projects/ProjectCard.tsx`
+
+**Replace** card-style layout with compact tree-row pattern:
+
+```tsx
+<div
+  className={`tree-row${active ? ' tree-row--active' : ''}`}
+  onClick={onClick}
+>
+  <span
+    className="tree-row-dot"
+    style={{ background: statusDotColor(project.status) }}
+  />
+  <span className="tree-row-label">{project.name}</span>
+
+  <div className="tree-row-actions">
+    {hasActiveSession && (
+      <button
+        className="tree-action-btn tree-action-btn--danger"
+        onClick={handleKill}
+        title="Kill session"
+      >
+        <Square size={11} />
+      </button>
+    )}
+    <button
+      className="tree-action-btn tree-action-btn--danger"
+      onClick={handleDeleteClick}
+      title="Delete"
+    >
+      <Trash2 size={11} />
+    </button>
+  </div>
+
+  {badge && (
+    <span className="tree-row-badge" style={{ color: badge.dot }}>
+      {badge.label}
+    </span>
+  )}
+</div>
+```
+
+```typescript
+function statusDotColor(status: ProjectStatus): string {
+  return {
+    running:   'var(--green)',
+    paused:    'var(--yellow)',
+    completed: 'var(--accent)',
+    cancelled: 'var(--red)',
+    idle:      'var(--text-3)',
+  }[status];
+}
+```
+
+**CSS:**
+
+```css
+.tree-row {
+  display: flex; align-items: center; gap: 6px;
+  height: 26px; padding: 0 8px 0 10px; cursor: pointer;
+  transition: background var(--t-fast);
+  position: relative;
+}
+.tree-row:hover { background: var(--bg-hover); }
+.tree-row:hover .tree-row-actions  { opacity: 1; pointer-events: auto; }
+.tree-row:hover .tree-row-badge    { opacity: 0; }
+
+.tree-row--active {
+  background: var(--accent-glow);
+}
+.tree-row--active::before {
+  content: ''; position: absolute; left: 0; top: 0; bottom: 0;
+  width: 2px; background: var(--accent);
+}
+
+.tree-row-dot   { width: 6px; height: 6px; border-radius: 50%; flex-shrink: 0; }
+.tree-row-label { flex: 1; font-size: 13px; color: var(--text-1);
+                  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.tree-row-badge { font-size: 10px; color: var(--text-2); }
+
+.tree-row-actions {
+  display: flex; gap: 2px; opacity: 0; pointer-events: none;
+  transition: opacity var(--t-fast);
+}
+.tree-action-btn {
+  width: 18px; height: 18px; display: flex; align-items: center; justify-content: center;
+  background: none; border: none; cursor: pointer; color: var(--text-2);
+  transition: color var(--t-fast);
+}
+.tree-action-btn:hover { color: var(--text-0); }
+.tree-action-btn--danger:hover { color: var(--red); }
+```
+
+---
+
+## 9. File Scope
+
+All files that must be created or modified:
+
+| File | Change | Key additions |
+|------|--------|---------------|
+| `src/types/loop.ts` | Modify | `ActivityEventType`, `ActivityEvent`, `ProgressSnapshot` types |
+| `src/store/loopSlice.ts` | Modify | `rawProgressContent`, `activityEvents`, `addActivityEvent`; update `setProgress` signature; ActivityEvent generation logic in `setLoopState`, `setJudgeFeedback` |
+| `src/store/settingsSlice.ts` | Modify | `activeQuestion`, `setActiveQuestion` |
+| `src/App.tsx` | Modify | Update `setProgress(parsed, raw)` call; add `judge-evolution-changed` listener if missing |
+| `src/lib/state-parser.ts` | Verify | Ensure phase derivation matches spec §3.1 |
+| `src/lib/progress-parser.ts` | Verify/Modify | Ensure `ORIGINAL_GOAL`, `ITERATION`, `revisit_if` fields are extracted; ensure `CONFIDENCE` clamping |
+| `src/lib/rubric-generator.ts` | Modify | Default `maxIterations=50`, anti-early-completion instructions |
+| `src/components/monitor/ActivityFeed.tsx` | **New** | Full implementation per §7.1 |
+| `src/components/monitor/IterationTimeline.tsx` | Modify | Rich snapshot panel per §7.2 |
+| `src/components/monitor/ProgressSummary.tsx` | Modify | Expand/collapse per §7.3; null guard |
+| `src/components/monitor/JudgeFeedback.tsx` | Modify | `formatFeedbackTime`; iteration badge per §7.4 |
+| `src/components/monitor/LoopMonitor.tsx` | Modify | SessionReport per §7.5; render `QuestionPromptOverlay` |
+| `src/components/monitor/QuestionPromptOverlay.tsx` | **New** | Full implementation per §7.8 |
+| `src/components/projects/ProjectList.tsx` | Modify | Completed project history view per §7.6 |
+| `src/components/memory/MemoryBrowser.tsx` | Modify | `JudgeEvolutionLog` section per §7.7 |
+| `src/components/layout/RightPanel.tsx` | Modify | Vertical activity bar per §8.2; raw log tab for `advancedMode` |
+| `src/components/layout/Titlebar.tsx` | Modify | Icon-only buttons per §8.1 |
+| `src/components/projects/ProjectCard.tsx` | Modify | Tree row pattern per §8.3 |
+| `src/styles/globals.css` | Modify | Add: `snapshot-*`, `activity-event-*`, `result-stat-*`, `question-*`, `tree-row-*`, `activity-tab`, `right-panel-activity-bar` classes |
+| `src-tauri/src/watcher/mod.rs` | Verify | Confirm `JUDGE_EVOLUTION.md` → `judge-evolution-changed` is implemented |
+| `src-tauri/src/process/mod.rs` | Modify | `detect_question_block`, `QuestionBlock` struct, emit `claude-question-prompt` |
+| `src/lib/rubric-generator.ts` | Modify | Flatten multi-line prompt (§7.10); defaults `maxIterations=50`, `milestoneEvery=0` |
+| `src/components/projects/QuickRestartView.tsx` | Modify | Output-triggered timing (§7.11.1); flatten prompt before send |
+| `src/components/wizard/GoalWizard.tsx` | Modify | Output-triggered timing (§7.11.1); flatten prompt before send |
+| `src/components/monitor/MilestoneGate.tsx` | Modify | Add `projectId`; use `send_command_enter` (§7.11.2, §7.11.3) |
+| `src/components/monitor/HITLGate.tsx` | Modify | Unify to `send_command_enter` with `projectId` (§7.11.3) |
+
+---
+
+## 10. Acceptance Criteria (Binary Pass/Fail)
+
+Every item must pass before the feature is considered complete.
+
+### Parser Unit Tests
+
+```
+[ ] P1.  parseProgress("COMPLETED:\n- task 1\n- task 2\nCONFIDENCE: 72\nNEXT_STEP: next")
+         → completed=["task 1","task 2"], confidence=72, nextStep="next"
+
+[ ] P2.  parseProgress("") → returns null
+
+[ ] P3.  parseProgress("CONFIDENCE: 150") → confidence=100
+
+[ ] P4.  parseProgress("CONFIDENCE: 10")  → confidence=30
+
+[ ] P5.  parseProgress("CONFIDENCE: abc") → confidence=null
+
+[ ] P6.  parseProgress("DECISIONS:\n- chose: React, rejected: Vue, reason: ecosystem")
+         → decisions=[{chose:"React", rejected:"Vue", reason:"ecosystem", revisitIf:null}]
+
+[ ] P7.  parseProgress("DECISIONS:\n- chose: TypeScript")
+         → decisions=[{chose:"TypeScript", rejected:null, reason:null, revisitIf:null}]
+
+[ ] P8.  parseLoopState(yaml with active:true, pause_reason:"") → phase="running"
+
+[ ] P9.  parseLoopState(yaml with active:false, pause_reason:"hitl") → phase="paused"
+
+[ ] P10. parseLoopState(yaml with active:false, pause_reason:"milestone") → phase="paused"
+
+[ ] P11. parseLoopState(yaml with active:false, pause_reason:"") → phase="completed"
+
+[ ] P12. parseLoopState(null) → null (no exception)
+
+[ ] P13. parseJudgeFeedback("## Iteration 3 — REJECTED (2 consecutive) — 2026-01-01 12:00:00\n\nBad code.")
+         → [{iteration:3, approved:false, consecutive:2, summary:"Bad code."}]
+
+[ ] P14. JUDGE_EVOLUTION.md line not matching regex → silently skipped, no exception
+```
+
+### State Machine
+
+```
+[ ] S1.  loop-state-changed(active:true) → loopState.phase === 'running'
+
+[ ] S2.  loop-state-changed(active:false, pause_reason:'hitl') → phase === 'paused'
+
+[ ] S3.  Sequence: paused → loop-state-changed(active:true) → phase === 'running'
+
+[ ] S4.  loop-state-changed(active:false, pause_reason:'') → phase === 'completed'
+
+[ ] S5.  loop-state-changed with deleted:true → phase === 'completed'
+
+[ ] S6.  loop-state-changed(content:null) → loopState === null
+
+[ ] S7.  After phase='completed', another loop-state-changed does NOT change phase
+         (terminal state invariant)
+```
+
+### ActivityFeed
+
+```
+[ ] A1.  First loop-state-changed(active:true, prev=null) → 'loop-started' event in activityEvents
+
+[ ] A2.  loop-state-changed(iteration:2, prev.iteration:1) → 'iteration-complete' event
+
+[ ] A3.  loop-state-changed(phase:'paused', pauseReason:'hitl') → 'loop-paused-hitl' event
+
+[ ] A4.  loop-state-changed(phase:'paused', pauseReason:'milestone') → 'loop-paused-milestone' event
+
+[ ] A5.  loop-state-changed(phase:'completed') → 'loop-completed' event
+
+[ ] A6.  setProgress(data, raw) → 'progress-updated' event
+
+[ ] A7.  JudgeFeedbackEntry with approved:false added → 'iteration-failed' event
+
+[ ] A8.  ActivityFeed renders events newest-first
+
+[ ] A9.  ActivityFeed with 0 events → renders "Start a loop to see activity." and nothing else
+
+[ ] A10. 'iteration-complete' dot color = var(--green)
+
+[ ] A11. 'iteration-failed' dot color = var(--red)
+
+[ ] A12. 'loop-completed' dot color = var(--accent)
+```
+
+### IterationTimeline
+
+```
+[ ] T1.  Iteration count goes 1→2 → new node "Round 2" appears in timeline
+
+[ ] T2.  Active node sublabel = progress.nextStep value
+
+[ ] T3.  nextStep === null → no sublabel rendered (no empty string, no placeholder)
+
+[ ] T4.  Click on round with snapshot → snapshot panel shows completed/decisions/uncertainties
+
+[ ] T5.  Click on round without snapshot → "No snapshot for this round." rendered
+
+[ ] T6.  Round with REJECTED JudgeFeedback → node has red border (failed status)
+
+[ ] T7.  Round with both REJECTED and APPROVED entries → node is 'completed' (not 'failed')
+
+[ ] T8.  snapshot.confidence === null → confidence display is absent (no "null%" or "0%")
+
+[ ] T9.  snapshot.completed.length === 0 → completed section not rendered at all
+```
+
+### SessionReport
+
+```
+[ ] R1.  loopState.phase === 'completed' → SessionReport rendered
+
+[ ] R2.  loopState.phase === 'cancelled' → SessionReport rendered with "Remaining" section
+
+[ ] R3.  loopState.phase === 'running' → SessionReport NOT rendered
+
+[ ] R4.  loopState.phase === 'cancelled', progress.remainingGap=[] → "Remaining" section not rendered
+
+[ ] R5.  progress.completed.length === 5 → first 3 shown + "+2 more" button
+
+[ ] R6.  Click "+2 more" → all 5 shown + "Show less" button
+
+[ ] R7.  judgeEnabled:false → no "Rejections" stat card
+
+[ ] R8.  judgeEnabled:true → "Rejections" stat card visible
+
+[ ] R9.  progress.originalGoal === null → GoalBanner shows "No goal recorded" (not empty)
+
+[ ] R10. "New Goal" button calls resetLoop() and transitions to GoalWizard
+```
+
+### Completed Project History
+
+```
+[ ] H1.  project.status==='completed' + session data exists → click shows SessionReport
+
+[ ] H2.  project.status==='completed' + no session data → click shows QuickRestartView
+
+[ ] H3.  project.status==='running' → click shows LoopMonitor (running view)
+
+[ ] H4.  synthetic LoopState.iteration = max(iterations[].iteration) from session data
+
+[ ] H5.  synthetic LoopState.originalPrompt = session data progress.originalGoal
+```
+
+### UI / Layout
+
+```
+[ ] U1.  ProjectCard height = 26px (measured via DevTools computed styles)
+
+[ ] U2.  tree-row hover: action buttons (Trash2, Square) appear; badge disappears
+
+[ ] U3.  tree-row normal state: action buttons hidden (opacity:0, pointer-events:none)
+
+[ ] U4.  Titlebar: zero text nodes in button area (icon-only)
+
+[ ] U5.  Right panel activity bar (36px wide) always visible regardless of rightTab state
+
+[ ] U6.  Same-tab click when panel open → panel closes; activity bar remains visible
+
+[ ] U7.  Right panel content area width = 280px
+
+[ ] U8.  Active activity-tab has 2px left accent border + accent-glow background
+```
+
+### AskUserQuestion Overlay
+
+```
+[ ] Q1.  PTY outputs "Your choice (1-3):" pattern → overlay appears
+
+[ ] Q2.  Overlay shows question text and all choices
+
+[ ] Q3.  Clicking choice 2 → send_command called with "2\r" → overlay closes within 200ms
+
+[ ] Q4.  "Type manually" click → overlay closes, terminal remains usable
+
+[ ] Q5.  choices.length > 10 → overlay shows max 10 choices
+
+[ ] Q6.  loopState === null → overlay not shown even if event fires
+```
+
+### PTY Transmission & Timing (Bug Fixes §7.10–7.11)
+
+```
+[ ] G1.  buildGulfLoopPrompt output has all \n replaced with space before PTY send
+         — verify: the string passed to send_command_enter contains no \n or \r
+
+[ ] G2.  After spawn_claude, command is NOT sent immediately (no fixed sleep)
+
+[ ] G3.  After first claude-output event for the project → command sent after exactly 2 000ms
+
+[ ] G4.  If no claude-output within 12 000ms → command sent anyway (hard fallback)
+
+[ ] G5.  sendCommand is idempotent: called at most once per loop start even if
+         multiple claude-output events arrive before the 2s delay expires
+
+[ ] G6.  MilestoneGate "Resume" button calls invoke('send_command_enter', { projectId, data })
+         — projectId must NOT be undefined or empty string
+
+[ ] G7.  MilestoneGate "Cancel" button calls invoke('send_command_enter', { projectId, data })
+
+[ ] G8.  HITLGate "Resume" button calls invoke('send_command_enter', { projectId, data })
+
+[ ] G9.  HITLGate "Cancel" button calls invoke('send_command_enter', { projectId, data })
+
+[ ] G10. No gate component uses bare invoke('send_command', ...) for slash commands
+```
+
+### Build Verification
+
+```
+[ ] B1.  npx tsc --noEmit — zero errors
+
+[ ] B2.  cargo check — zero errors
+
+[ ] B3.  Full gulf-loop run (5+ iterations): round counter increments in timeline
+
+[ ] B4.  gulf-loop completes: SessionReport shows correct stats (rounds, tasks done, confidence)
+
+[ ] B5.  Reload app, click completed project → SessionReport loads from session.json
+```
+
+---
+
+## 11. Future Work
+
+### High Priority
+
+1. **Gulf-loop install verification** — Before starting a loop, call `check_gulf_loop_installed()`. If `false`, show a clear error with install instructions. Block loop start.
+
+2. **Max iterations UI** — Add a slider (`10–100`) in `QuickRestartView` that sets `maxIterations` when starting a new loop.
+
+3. **Force-max toggle** — Checkbox in `QuickRestartView` that adds `force_max: true` to gulf-loop state file, preventing early completion.
+
+4. **Session list view** — "View history" button per project. Calls `list_sessions(projectPath)` and displays archived sessions as selectable items.
+
+5. **JudgeEvolution in right panel** — `JudgeEvolutionLog` component integrated into MemoryBrowser tab.
+
+### Medium Priority
+
+6. **Round-over-round progress diff** — When viewing a snapshot, show Δ confidence and Δ completed tasks vs. previous round.
+
+7. **Estimated cost display** — `TokenUsageCard` should show a running cost estimate: `estimateCostKrw(loopState.iteration)` from `cost-calculator.ts`.
+
+8. **Theme persistence fix** — `save_settings` must be called after every theme change. Verify with `get_settings` on restart.
+
+### Lower Priority
+
+9. **Offline cached sessions** — When `start_watcher` fails (project path inaccessible), auto-load the last `session.json` and show it as read-only.
+
+10. **Multi-project comparison** — Side-by-side `SessionReport` view for two projects.
+
+11. **Export session report** — "Export" button on `SessionReport` that serializes the full report to Markdown and opens a save dialog via Tauri's `dialog` plugin.
